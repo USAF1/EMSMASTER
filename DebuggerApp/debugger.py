@@ -32,7 +32,7 @@ from datetime import datetime
 DEFAULT_IP            = "192.168.0.211"
 DEFAULT_PORT          = 8765
 RECONNECT_INTERVAL_S  = 5
-RELAY_NO_DATA_TIMEOUT = 10   # seconds before "waiting for Scheduler" shown
+RELAY_NO_DATA_TIMEOUT = 10
 
 # ============================================================================
 # COLOURS — dark theme
@@ -197,14 +197,14 @@ class DebuggerApp:
         self.ip       = ip
         self.port     = port
         self._q       = queue.Queue()
-        self._sensors = {}          # str(idx) -> sensor dict
+        self._sensors = {}
         self._hub_cfg = {}
-        self._last_relay_time = None  # time.monotonic() of last scheduler_update
+        self._last_relay_time = None
 
         root.title(
             "Innovatsii EMS — Pico 1 Debugger  |  {}:{}".format(ip, port))
         root.configure(bg=C_BG)
-        root.geometry("1400x900")
+        root.geometry("1400x950")
         root.minsize(1100, 700)
 
         self._build_ui()
@@ -223,7 +223,7 @@ class DebuggerApp:
     # -----------------------------------------------------------------------
 
     def _build_ui(self):
-        top = tk.Frame(self.root, bg=C_PANEL, height=56)
+        top = tk.Frame(self.root, bg=C_PANEL, height=60)
         top.pack(fill=tk.X)
         top.pack_propagate(False)
 
@@ -251,12 +251,25 @@ class DebuggerApp:
             font=("Segoe UI", 10))
         self._lbl_inet.pack(side=tk.LEFT, padx=12)
 
+        self._lbl_ntp = tk.Label(
+            top, text="NTP: —",
+            fg=C_DIM, bg=C_PANEL,
+            font=("Segoe UI", 10))
+        self._lbl_ntp.pack(side=tk.LEFT, padx=8)
+
+        self._lbl_utc = tk.Label(
+            top, text="UTC: —",
+            fg=C_DIM, bg=C_PANEL,
+            font=("Segoe UI", 10))
+        self._lbl_utc.pack(side=tk.LEFT, padx=8)
+
         self._lbl_pending = tk.Label(
             top, text="",
             fg=C_YELLOW, bg=C_PANEL,
             font=("Segoe UI", 10))
         self._lbl_pending.pack(side=tk.LEFT, padx=12)
 
+        # RIGHT side
         self._lbl_ip = tk.Label(
             top, text="IP: —",
             fg=C_DIM, bg=C_PANEL,
@@ -268,6 +281,34 @@ class DebuggerApp:
             fg=C_DIM, bg=C_PANEL,
             font=("Segoe UI", 10))
         self._lbl_hub.pack(side=tk.RIGHT, padx=16)
+
+        # Refresh All button in top bar
+        btn_refresh = tk.Button(
+            top, text="⟳  Refresh All",
+            command=self._refresh_all,
+            bg=C_BORDER, fg=C_BLUE,
+            activebackground=C_PANEL,
+            activeforeground=C_BLUE,
+            relief=tk.FLAT,
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+            padx=10, pady=4
+        )
+        btn_refresh.pack(side=tk.RIGHT, padx=8, pady=10)
+
+        # NTP Sync button
+        btn_ntp = tk.Button(
+            top, text="🕐 NTP Sync",
+            command=self._ntp_sync,
+            bg=C_BORDER, fg=C_TEAL,
+            activebackground=C_PANEL,
+            activeforeground=C_TEAL,
+            relief=tk.FLAT,
+            font=("Segoe UI", 9),
+            cursor="hand2",
+            padx=8, pady=4
+        )
+        btn_ntp.pack(side=tk.RIGHT, padx=4, pady=10)
 
         style = ttk.Style()
         style.theme_use("default")
@@ -324,7 +365,7 @@ class DebuggerApp:
         self._lbl_unit_big = tk.Label(
             uf, text="—", fg=C_DIM, bg=C_BG,
             font=("Segoe UI", 28, "bold"))
-        self._lbl_unit_big.grid(row=0, column=0, pady=16, padx=20)
+        self._lbl_unit_big.grid(row=0, column=0, pady=10, padx=20)
 
         self._lbl_sensor_occ = tk.Label(
             uf, text="Sensor: —", fg=C_DIM, bg=C_BG,
@@ -337,10 +378,15 @@ class DebuggerApp:
             font=("Segoe UI", 10))
         self._lbl_inet_mode.grid(row=2, column=0, pady=2)
 
+        self._lbl_utc_big = tk.Label(
+            uf, text="UTC: —", fg=C_DIM, bg=C_BG,
+            font=("Segoe UI", 9))
+        self._lbl_utc_big.grid(row=3, column=0, pady=1)
+
         self._lbl_pending2 = tk.Label(
             uf, text="", fg=C_YELLOW, bg=C_BG,
             font=("Segoe UI", 10))
-        self._lbl_pending2.grid(row=3, column=0, pady=2)
+        self._lbl_pending2.grid(row=4, column=0, pady=2)
 
         qf = make_frame(p, "Quick Actions", row=0, col=1)
         qf.columnconfigure(0, weight=1)
@@ -400,6 +446,7 @@ class DebuggerApp:
             ("unit",     C_PURPLE),
             ("hub",      C_BLUE),
             ("inet",     C_ORANGE),
+            ("ntp",      C_TEAL),
             ("dim",      C_DIM),
             ("info",     C_TEXT),
             ("sched",    C_TEAL),
@@ -542,10 +589,11 @@ class DebuggerApp:
             e.grid(row=r, column=1, sticky="ew", padx=8, pady=4)
             self._cfg_entries[key] = e
 
+        btn_row = len(unit_fields)
         make_button(uf, "Save Unit Config",
                     self._save_unit_config,
                     fg=C_GREEN,
-                    row=len(unit_fields), col=0,
+                    row=btn_row, col=0,
                     sticky="ew", padx=8, pady=8)
 
         # Hub config
@@ -627,21 +675,27 @@ class DebuggerApp:
         # System commands
         df = make_frame(p, "System Commands", row=1, col=1)
         df.columnconfigure(0, weight=1)
+        make_button(df, "Refresh All",
+                    self._refresh_all,
+                    fg=C_BLUE, row=0, col=0, sticky="ew", padx=8, pady=4)
+        make_button(df, "NTP Sync Now",
+                    self._ntp_sync,
+                    fg=C_TEAL, row=1, col=0, sticky="ew", padx=8, pady=4)
         make_button(df, "Restart Master",
                     self._restart_master,
-                    fg=C_RED, row=0, col=0, sticky="ew", padx=8, pady=4)
+                    fg=C_RED, row=2, col=0, sticky="ew", padx=8, pady=4)
         make_button(df, "Restart Sensor Hub",
                     self._restart_hub,
-                    fg=C_ORANGE, row=1, col=0, sticky="ew", padx=8, pady=4)
+                    fg=C_ORANGE, row=3, col=0, sticky="ew", padx=8, pady=4)
         make_button(df, "Hub Factory Reset",
                     self._hub_factory_reset,
-                    fg=C_RED, row=2, col=0, sticky="ew", padx=8, pady=4)
+                    fg=C_RED, row=4, col=0, sticky="ew", padx=8, pady=4)
         make_button(df, "Restart Scheduler",
                     self._restart_scheduler,
-                    fg=C_ORANGE, row=3, col=0, sticky="ew", padx=8, pady=4)
+                    fg=C_ORANGE, row=5, col=0, sticky="ew", padx=8, pady=4)
         make_button(df, "Scheduler Factory Reset",
                     self._scheduler_factory_reset,
-                    fg=C_RED, row=4, col=0, sticky="ew", padx=8, pady=4)
+                    fg=C_RED, row=6, col=0, sticky="ew", padx=8, pady=4)
 
     # -----------------------------------------------------------------------
     # LOGS TAB
@@ -704,7 +758,6 @@ class DebuggerApp:
         self.root.after(50, self._poll_queue)
 
     def _check_relay_timeout(self):
-        """Show warning on relay tab if no Scheduler data received yet."""
         if self._last_relay_time is None:
             self._lbl_relay_header.config(
                 text="Waiting for Scheduler data...", fg=C_YELLOW)
@@ -726,7 +779,6 @@ class DebuggerApp:
     def _ui_on_connect(self):
         self._lbl_conn.config(text="⬤  Connected", fg=C_GREEN)
         self._log("Connected to {}:{}".format(self.ip, self.port), "info")
-        # Request state snapshot only — no automatic get_sensor_config
         self._tcp.send({"type": "get_state"})
 
     def _ui_on_disconnect(self):
@@ -749,9 +801,39 @@ class DebuggerApp:
             self._log_event(
                 "INTERNET {}".format("RESTORED" if up else "LOST"), "inet")
 
+        elif t == "ntp_status":
+            synced = msg.get("synced", False)
+            utc    = msg.get("utc", "")
+            if synced:
+                self._lbl_ntp.config(text="NTP: ✓", fg=C_GREEN)
+                self._lbl_utc.config(text="UTC: {}".format(utc), fg=C_GREEN)
+                self._lbl_utc_big.config(text="UTC: {}".format(utc), fg=C_GREEN)
+                self._log_event("NTP SYNCED — UTC: {}".format(utc), "ntp")
+            else:
+                self._lbl_ntp.config(text="NTP: ✗", fg=C_RED)
+                self._log_event("NTP SYNC FAILED", "alarm")
+
         elif t == "unit_occupancy":
             s = msg.get("state", "VACANT")
             self._log_event("UNIT OCCUPANCY → {}".format(s), "unit")
+
+        elif t == "unit_state_update":
+            # Direct state update (e.g. from force_status or recalc)
+            status = msg.get("status", "Unknown")
+            colour = STATUS_COLOURS.get(status, C_DIM)
+            self._lbl_unit_big.config(text=status, fg=colour)
+            self._lbl_unit.config(text="Unit: {}".format(status), fg=colour)
+            self._log_event("UNIT STATE → {}".format(status), "unit")
+
+        elif t == "pending_update":
+            pending = msg.get("pending_status")
+            if pending:
+                txt = "⏳ Pending: {}".format(pending)
+                self._lbl_pending.config(text=txt)
+                self._lbl_pending2.config(text=txt)
+            else:
+                self._lbl_pending.config(text="")
+                self._lbl_pending2.config(text="")
 
         elif t == "hub_boot":
             count = msg.get("sensor_count", 0)
@@ -764,9 +846,10 @@ class DebuggerApp:
             off = msg.get("offline_count", 0)
             self._log_event(
                 "HUB READY — online={} offline={}".format(on, off), "hub")
+            colour = C_GREEN if on > 0 else C_YELLOW
             self._lbl_hub.config(
-                text="Hub: READY ({} online)".format(on), fg=C_GREEN)
-            # Auto-refresh sensor list when hub is ready
+                text="Hub: READY ({} online)".format(on), fg=colour)
+            # Auto-refresh sensor list
             self._tcp.send({"type": "get_sensor_config"})
 
         elif t == "sensor_presence":
@@ -834,7 +917,6 @@ class DebuggerApp:
             cmd = msg.get("command", "?")
             st  = msg.get("status", "?")
             self._log_event("ACK  {}  {}".format(cmd, st), "dim")
-            # Log config saves in event feed
             if cmd in ("set_unit_config", "set_hub_config", "set_wifi_config"):
                 self._log_event(
                     "Config saved — Master acknowledged ({})".format(cmd), "info")
@@ -852,6 +934,8 @@ class DebuggerApp:
         pending   = snap.get("pending_status")
         ip        = snap.get("wifi_ip",          "")
         inet_up   = snap.get("internet_up",      False)
+        ntp_ok    = snap.get("ntp_synced",       False)
+        utc_now   = snap.get("utc_now",          "")
         sched     = snap.get("scheduler_status", "")
         hub_cfg   = snap.get("sensor_hub_config", {})
         hub_state = snap.get("hub_state",        "UNKNOWN")
@@ -868,7 +952,17 @@ class DebuggerApp:
 
         self._update_internet_indicator(inet_up)
 
-        # Hub label from snapshot — solves "Hub: —" after connect
+        # NTP status
+        if ntp_ok:
+            self._lbl_ntp.config(text="NTP: ✓", fg=C_GREEN)
+            self._lbl_utc.config(text="UTC: {}".format(utc_now), fg=C_GREEN)
+            self._lbl_utc_big.config(text="UTC: {}".format(utc_now), fg=C_GREEN)
+        else:
+            self._lbl_ntp.config(text="NTP: ✗", fg=C_RED)
+            self._lbl_utc.config(text="UTC: not synced", fg=C_RED)
+            self._lbl_utc_big.config(text="UTC: not synced", fg=C_RED)
+
+        # Hub label
         if hub_state == "READY":
             self._lbl_hub.config(text="Hub: READY", fg=C_GREEN)
         elif hub_state == "BOOTING":
@@ -890,10 +984,10 @@ class DebuggerApp:
         if sched:
             self._apply_relay_snapshot({}, sched)
 
-        # Populate config tab entries
+        # Populate config tab entries from snapshot
         for key, entry in self._cfg_entries.items():
             if key == "wifi_password":
-                continue   # never populate password field from snapshot
+                continue
             val = snap.get(key, "")
             if val is None:
                 val = ""
@@ -910,7 +1004,8 @@ class DebuggerApp:
         if "watchdog_enable" in hub_cfg:
             self._wd_enable_var.set(bool(hub_cfg["watchdog_enable"]))
 
-        self._log_event("State snapshot received — unit={}".format(unit), "dim")
+        self._log_event("State snapshot received — unit={}  ntp={}  utc={}".format(
+            unit, "✓" if ntp_ok else "✗", utc_now), "dim")
 
     def _update_internet_indicator(self, is_up):
         if is_up:
@@ -936,7 +1031,6 @@ class DebuggerApp:
             role   = s.get("role",  "?")
             online = "✓" if s.get("online", False) else "✗"
             batt   = "{}%".format(s.get("battery", "?"))
-            # State column: door sensors show OPEN/CLOSED, presence show YES/NO
             if role == "DOOR":
                 contact = s.get("contact", "—")
                 state_v = contact if contact else "—"
@@ -952,9 +1046,7 @@ class DebuggerApp:
             self._sensors[name]     = s
 
     def _refresh_sensor_row(self, s):
-        """Update a single sensor row from heartbeat data."""
         name = s.get("name", "")
-        # Find by name
         for iid in self._sensor_tree.get_children():
             vals = list(self._sensor_tree.item(iid, "values"))
             if vals[1] == name:
@@ -962,7 +1054,6 @@ class DebuggerApp:
                 batt = s.get("battery", None)
                 if batt is not None:
                     vals[6] = "{}%".format(batt)
-                # contact / presence
                 contact = s.get("contact", None)
                 if contact is not None:
                     vals[5] = contact
@@ -974,7 +1065,6 @@ class DebuggerApp:
                 break
 
     def _update_sensor_state_col(self, name, state_val):
-        """Update the State column for a sensor by name."""
         for iid in self._sensor_tree.get_children():
             vals = list(self._sensor_tree.item(iid, "values"))
             if vals[1] == name:
@@ -1045,8 +1135,9 @@ class DebuggerApp:
 
     def _log_raw(self, msg):
         t = msg.get("type", "")
-        if t in ("state_snapshot", "pong", "scheduler_update"):
-            return   # too noisy — skip these in raw log
+        if t in ("state_snapshot", "pong", "scheduler_update",
+                 "pending_update", "unit_state_update"):
+            return
         self._log("← RX  {}".format(json.dumps(msg)[:140]), "rx")
 
     def _log_hub(self, line):
@@ -1064,6 +1155,16 @@ class DebuggerApp:
     # -----------------------------------------------------------------------
     # USER ACTIONS
     # -----------------------------------------------------------------------
+
+    def _refresh_all(self):
+        """Send get_state + get_sensor_config in one click."""
+        self._tcp.send({"type": "get_state"})
+        self._tcp.send({"type": "get_sensor_config"})
+        self._log("TX → Refresh All (get_state + get_sensor_config)", "tx")
+
+    def _ntp_sync(self):
+        self._tcp.send({"type": "ntp_sync"})
+        self._log("TX → ntp_sync", "tx")
 
     def _force_status(self, status):
         if messagebox.askyesno(
@@ -1230,7 +1331,6 @@ class DebuggerApp:
                 "sensor_index": int(idx),
                 "name":         new_name
             })
-            # Update treeview locally immediately — no round-trip wait
             new_vals    = list(vals)
             new_vals[1] = new_name
             self._sensor_tree.item(iid, values=new_vals)

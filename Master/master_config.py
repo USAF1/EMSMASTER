@@ -27,8 +27,6 @@ CONFIG_FILE = "master_config.json"
 
 # ============================================================================
 # DEFAULT CONFIGURATION
-# All values here are safe factory defaults.
-# Production values are pushed from EMQX MQTT backend.
 # ============================================================================
 
 DEFAULT_CONFIG = {
@@ -40,7 +38,7 @@ DEFAULT_CONFIG = {
     "wifi_ssid":            "",
     "wifi_password":        "",
 
-    # MQTT
+    # MQTT — Phase 6
     "mqtt_broker":          "",
     "mqtt_port":            1883,
     "mqtt_username":        "",
@@ -51,10 +49,10 @@ DEFAULT_CONFIG = {
     "check_in_utc":         "2000-01-01 00:00:00",
     "check_out_utc":        "2000-01-01 00:00:00",
 
-    # Buffer period in minutes (delay before applying Vacant/Sold Vacant)
+    # Buffer period in minutes
     "buffer_minutes":       15,
 
-    # Manual UTC clock override — for testing without NTP
+    # Manual UTC clock override — kept for offline testing fallback
     "use_manual_utc_now":   False,
     "manual_utc_now":       "2000-01-01 00:00:00",
 
@@ -63,7 +61,7 @@ DEFAULT_CONFIG = {
     "last_decided_status":  "Vacant",
     "last_scheduler_status": None,
 
-    # PZEM meter last readings — updated on every 0.5A change
+    # PZEM meter last readings — Phase 5
     "pzem_last_readings": {
         "MAIN": 0.0,
         "R1M":  0.0,
@@ -77,7 +75,6 @@ DEFAULT_CONFIG = {
     },
 
     # Sensor Hub configurable parameters
-    # Master pushes these to Sensor Hub on boot and on change
     "sensor_hub_config": {
         "pairing_duration_sec":      120,
         "watchdog_enable":           True,

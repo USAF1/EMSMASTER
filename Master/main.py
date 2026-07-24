@@ -2,7 +2,7 @@
 # Innovatsii EMS — Pico 1
 #
 # UART1 <-> Sensor Hub  (TX=GPIO16, RX=GPIO17)
-# UART2 <-> Scheduler   (TX=GPIO18, RX=GPIO21)
+# UART2 <-> Scheduler   (TX=GPIO18, RX=GPIO21) — Scheduler UART disabled until Phase 4
 # TCP   <-> Debugger App (port 8765)
 #
 # Production rules applied:
@@ -14,7 +14,7 @@
 #   - Every shared state access is lock-protected
 #   - UART TX serialised through helpers — never interleaved
 #   - TCP TX serialised through helper — never interleaved
-#   - Internet confirmed before ANY recalc — no premature 2-state decision
+#   - NTP sync after WiFi — real UTC epoch for booking window
 
 import utime
 import ujson as json
@@ -28,14 +28,17 @@ import master_config as cfg
 # CONSTANTS
 # ============================================================================
 
-UART_RX_BUF_MAX    = 512
-MAIN_LOOP_TICK_MS  = 1000
-TCP_PORT           = 8765
-TCP_RX_BUF_MAX     = 1024
-INTERNET_CHECK_HOST = "8.8.8.8"
-INTERNET_CHECK_PORT = 53
+UART_RX_BUF_MAX      = 512
+MAIN_LOOP_TICK_MS    = 1000
+TCP_PORT             = 8765
+TCP_RX_BUF_MAX       = 1024
+INTERNET_CHECK_HOST  = "8.8.8.8"
+INTERNET_CHECK_PORT  = 53
 INTERNET_CHECK_TIMEOUT_S = 3
-INTERNET_RECHECK_S = 60
+INTERNET_RECHECK_S   = 60
+NTP_SYNC_INTERVAL_S  = 3600        # re-sync NTP every hour
+HUB_CONFIG_RETRIES   = 3           # how many times to retry set_config to Hub
+HUB_CONFIG_RETRY_MS  = 2000        # ms between retries
 
 # ============================================================================
 # UART INITIALISATION
@@ -46,6 +49,7 @@ uart_sensor = UART(cfg.SENSOR_UART_ID,
                    tx=cfg.SENSOR_UART_TX,
                    rx=cfg.SENSOR_UART_RX)
 
+# Scheduler UART — initialised but sends disabled until Phase 4
 uart_sched  = UART(cfg.SCHED_UART_ID,
                    baudrate=cfg.SCHED_UART_BAUD,
                    tx=cfg.SCHED_UART_TX,
@@ -77,12 +81,17 @@ state = {
     "pending_apply_epoch":    0,
 }
 
-# Internet and hub tracking — not persisted
-_internet_up  = False
-_wifi_ip      = ""
-_hub_state    = "UNKNOWN"   # "UNKNOWN" | "BOOTING" | "READY"
-_tcp_client   = None        # active connected socket or None
-_mac_str      = ""
+# Internet / hub / NTP tracking — not persisted
+_internet_up     = False
+_wifi_ip         = ""
+_hub_state       = "UNKNOWN"   # "UNKNOWN" | "BOOTING" | "READY"
+_tcp_client      = None
+_mac_str         = ""
+_ntp_synced      = False       # True once NTP has set the RTC
+_last_ntp_sync   = 0           # ticks_ms of last successful NTP sync
+
+# Pending ACK tracking for hub set_config
+_hub_config_ack_pending = False
 
 # ============================================================================
 # PERSISTENT CONFIG
@@ -145,7 +154,9 @@ def send_to_sensor_hub(payload_dict):
 
 
 def send_to_scheduler(payload_dict):
-    _uart_send(uart_sched, _tx_sched_lock, payload_dict)
+    # Phase 4 — Scheduler UART sends disabled for now
+    # _uart_send(uart_sched, _tx_sched_lock, payload_dict)
+    print("SCHED TX (disabled): {}".format(payload_dict.get("type", "?")))
 
 
 # ============================================================================
@@ -163,13 +174,34 @@ def tcp_forward(msg_dict):
             if _tcp_client is not None:
                 _tcp_client.sendall(msg.encode("utf-8"))
     except Exception:
-        # Broken pipe — drop client; server thread will clean up
         _tcp_client = None
 
 
 # ============================================================================
 # UTC TIME HELPERS
 # ============================================================================
+
+def _sync_ntp():
+    """Try NTP sync. Returns True on success."""
+    global _ntp_synced, _last_ntp_sync
+    try:
+        import ntptime
+        ntptime.host = "pool.ntp.org"
+        ntptime.settime()
+        _ntp_synced    = True
+        _last_ntp_sync = utime.ticks_ms()
+        t = utime.localtime()
+        print("NTP: synced — UTC {}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
+              t[0], t[1], t[2], t[3], t[4], t[5]))
+        tcp_forward({"type": "ntp_status", "synced": True,
+                     "utc": "{}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
+                         t[0], t[1], t[2], t[3], t[4], t[5])})
+        return True
+    except Exception as e:
+        print("NTP: sync failed:", repr(e))
+        tcp_forward({"type": "ntp_status", "synced": False})
+        return False
+
 
 def parse_utc_to_epoch(dt_str):
     try:
@@ -184,10 +216,7 @@ def parse_utc_to_epoch(dt_str):
 
 
 def now_epoch_utc():
-    if conf.get("use_manual_utc_now", False):
-        base    = parse_utc_to_epoch(conf.get("manual_utc_now", "2000-01-01 00:00:00"))
-        elapsed = utime.ticks_diff(utime.ticks_ms(), boot_ms) // 1000
-        return base + elapsed
+    """Return current UTC epoch. Uses real RTC if NTP synced, else fallback."""
     return utime.time()
 
 
@@ -202,11 +231,13 @@ def in_booking_window(now_ep, checkin_ep, checkout_ep):
 def decide_status(sensor_status, now_ep):
     """
     2-state fallback when internet is down — booking window not trusted.
-    4-state full logic when internet is confirmed.
+    4-state full logic when internet is confirmed AND NTP is synced.
     """
-    if not _internet_up:
+    if not _internet_up or not _ntp_synced:
         result = "Occupied" if sensor_status == "occupied" else "Vacant"
-        print("DECIDE [2-state fallback]: sensor={} => {}".format(sensor_status, result))
+        reason = "no internet" if not _internet_up else "NTP not synced"
+        print("DECIDE [2-state fallback — {}]: sensor={} => {}".format(
+              reason, sensor_status, result))
         return result
 
     checkin_ep  = parse_utc_to_epoch(conf.get("check_in_utc",  "2000-01-01 00:00:00"))
@@ -218,18 +249,18 @@ def decide_status(sensor_status, now_ep):
     else:
         result = "Sold Vacant" if inside else "Vacant"
 
-    print("DECIDE [4-state]: sensor={} inside={} => {}".format(
-          sensor_status, inside, result))
+    print("DECIDE [4-state]: sensor={} inside={} now={} => {}".format(
+          sensor_status, inside, now_ep, result))
     return result
 
 
 # ============================================================================
-# SCHEDULER COMMANDS
+# SCHEDULER COMMANDS  (Phase 4 — disabled for now)
 # ============================================================================
 
 def send_status_to_scheduler(status):
-    send_to_scheduler({"type": "set_status", "status": status})
-    print("MASTER -> SCHED: set_status={}".format(status))
+    # Phase 4 disabled — just log
+    print("MASTER -> SCHED (disabled): set_status={}".format(status))
 
 
 def apply_immediate(status, force_send=False):
@@ -238,8 +269,10 @@ def apply_immediate(status, force_send=False):
         conf["last_decided_status"] = status
         save_config()
         send_status_to_scheduler(status)
+        # Notify debugger of state change
+        tcp_forward({"type": "unit_state_update", "status": status})
     else:
-        print("STATUS unchanged, not re-sent: {}".format(status))
+        print("STATUS unchanged: {}".format(status))
 
 
 def schedule_buffered(status, now_ep):
@@ -253,6 +286,10 @@ def schedule_buffered(status, now_ep):
     state["pending_apply_epoch"] = now_ep + buffer_min * 60
     print("BUFFERED: target={} apply_at={} now={}".format(
           status, state["pending_apply_epoch"], now_ep))
+    # Notify debugger of pending change
+    tcp_forward({"type": "pending_update",
+                 "pending_status": status,
+                 "apply_at_epoch": state["pending_apply_epoch"]})
 
 
 def recalc_and_act():
@@ -274,22 +311,27 @@ def recalc_and_act():
 
 def build_state_snapshot():
     with _state_lock:
+        t = utime.localtime()
+        utc_str = "{}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
+            t[0], t[1], t[2], t[3], t[4], t[5])
         snap = {
-            "type":             "state_snapshot",
-            "unit_state":       state["current_decided_status"] or "Unknown",
-            "sensor_occupancy": state["last_sensor_status"],
-            "pending_status":   state["pending_status"],
-            "internet_up":      _internet_up,
-            "wifi_ip":          _wifi_ip,
-            "hub_state":        _hub_state,
-            "scheduler_status": state["last_scheduler_status"],
-            "tenant_id":        conf.get("tenant_id", ""),
-            "unit_id":          conf.get("unit_id", ""),
-            "check_in_utc":     conf.get("check_in_utc", ""),
-            "check_out_utc":    conf.get("check_out_utc", ""),
-            "buffer_minutes":   conf.get("buffer_minutes", 15),
-            "wifi_ssid":        conf.get("wifi_ssid", ""),
-            "sensor_hub_config": conf.get("sensor_hub_config", {}),
+            "type":               "state_snapshot",
+            "unit_state":         state["current_decided_status"] or "Unknown",
+            "sensor_occupancy":   state["last_sensor_status"],
+            "pending_status":     state["pending_status"],
+            "internet_up":        _internet_up,
+            "ntp_synced":         _ntp_synced,
+            "utc_now":            utc_str,
+            "wifi_ip":            _wifi_ip,
+            "hub_state":          _hub_state,
+            "scheduler_status":   state["last_scheduler_status"],
+            "tenant_id":          conf.get("tenant_id", ""),
+            "unit_id":            conf.get("unit_id", ""),
+            "check_in_utc":       conf.get("check_in_utc", ""),
+            "check_out_utc":      conf.get("check_out_utc", ""),
+            "buffer_minutes":     conf.get("buffer_minutes", 15),
+            "wifi_ssid":          conf.get("wifi_ssid", ""),
+            "sensor_hub_config":  conf.get("sensor_hub_config", {}),
         }
     return snap
 
@@ -309,78 +351,62 @@ def _handle_unit_occupancy(msg):
         state["last_sensor_status"] = sensor_status
         conf["last_sensor_status"]  = sensor_status
         save_config()
-        print("SENSOR HUB occupancy={} internet={} ts={}".format(
-              sensor_status, "UP" if _internet_up else "DOWN",
-              msg.get("ts_utc", "?")))
+        print("SENSOR HUB occupancy={} ntp={} ts={}".format(
+              sensor_status, _ntp_synced, msg.get("ts_utc", "?")))
         recalc_and_act()
     tcp_forward(msg)
 
 
 def _handle_sensor_presence(msg):
-    sensor    = msg.get("sensor", "unknown")
-    state_val = msg.get("state", "?")
-    model     = msg.get("model", "?")
-    ts        = msg.get("ts_utc", "?")
-    print("PRESENCE: sensor={} model={} state={} ts={}".format(
-          sensor, model, state_val, ts))
+    print("PRESENCE: sensor={} state={} ts={}".format(
+          msg.get("sensor", "?"), msg.get("state", "?"), msg.get("ts_utc", "?")))
     tcp_forward(msg)
 
 
 def _handle_environment(msg):
-    sensor    = msg.get("sensor", "unknown")
     temp_x100 = msg.get("temp_c_x100", 0)
-    hum_x100  = msg.get("hum_pct_x100", 0)
-    ts        = msg.get("ts_utc", "?")
     if not isinstance(temp_x100, (int, float)):
         print("WARN environment: invalid temp field")
         return
     print("ENVIRONMENT: sensor={} temp={:.2f}C hum={:.2f}% ts={}".format(
-          sensor, temp_x100 / 100.0, hum_x100 / 100.0, ts))
+          msg.get("sensor", "?"), temp_x100 / 100.0,
+          msg.get("hum_pct_x100", 0) / 100.0, msg.get("ts_utc", "?")))
     tcp_forward(msg)
 
 
 def _handle_door(msg):
-    sensor     = msg.get("sensor", "unknown")
-    door_state = msg.get("state", "?")
-    ts         = msg.get("ts_utc", "?")
-    print("DOOR: sensor={} state={} ts={}".format(sensor, door_state, ts))
+    print("DOOR: sensor={} state={} ts={}".format(
+          msg.get("sensor", "?"), msg.get("state", "?"), msg.get("ts_utc", "?")))
     tcp_forward(msg)
 
 
 def _handle_door_alarm(msg):
-    sensor   = msg.get("sensor", "unknown")
-    alarm    = msg.get("state", "?")
-    duration = msg.get("duration_sec", 0)
-    ts       = msg.get("ts_utc", "?")
     print("DOOR ALARM: sensor={} state={} duration={}s ts={}".format(
-          sensor, alarm, duration, ts))
+          msg.get("sensor", "?"), msg.get("state", "?"),
+          msg.get("duration_sec", 0), msg.get("ts_utc", "?")))
     tcp_forward(msg)
 
 
 def _handle_sensor_health(msg):
-    sensor = msg.get("sensor", "unknown")
-    health = msg.get("state", "?")
-    ts     = msg.get("ts_utc", "?")
-    print("SENSOR HEALTH: sensor={} state={} ts={}".format(sensor, health, ts))
+    print("SENSOR HEALTH: sensor={} state={} ts={}".format(
+          msg.get("sensor", "?"), msg.get("state", "?"), msg.get("ts_utc", "?")))
     tcp_forward(msg)
 
 
 def _handle_battery(msg):
-    sensor = msg.get("sensor", "unknown")
-    pct    = msg.get("battery_pct", 0)
-    ts     = msg.get("ts_utc", "?")
-    print("BATTERY: sensor={} pct={}% ts={}".format(sensor, pct, ts))
+    print("BATTERY: sensor={} pct={}% ts={}".format(
+          msg.get("sensor", "?"), msg.get("battery_pct", 0), msg.get("ts_utc", "?")))
     tcp_forward(msg)
 
 
 def _handle_heartbeat(msg):
-    unit = msg.get("unit_state", "?")
-    ts   = msg.get("ts_utc", "?")
-    print("HEARTBEAT: unit={} ts={}".format(unit, ts))
+    print("HEARTBEAT: unit={} ts={}".format(
+          msg.get("unit_state", "?"), msg.get("ts_utc", "?")))
     tcp_forward(msg)
 
 
 def _handle_config_response(msg):
+    global _hub_config_ack_pending
     sensors = msg.get("sensors", [])
     if not isinstance(sensors, list):
         return
@@ -400,16 +426,20 @@ def _handle_config_response(msg):
 
 
 def _handle_ack(msg):
+    global _hub_config_ack_pending
     cmd    = msg.get("command", "?")
     status = msg.get("status", "?")
-    ts     = msg.get("ts_utc", "?")
-    print("ACK: command={} status={} ts={}".format(cmd, status, ts))
+    print("ACK: command={} status={} ts={}".format(
+          cmd, status, msg.get("ts_utc", "?")))
+    # Mark config ACK received so retry loop stops
+    if cmd == "set_config" and status == "ok":
+        _hub_config_ack_pending = False
+        print("HUB CONFIG: ACK confirmed — config applied")
     tcp_forward(msg)
 
 
 def _handle_log_response(msg):
-    line = msg.get("line", "")
-    print("SENSORHUB LOG:", line)
+    print("SENSORHUB LOG:", msg.get("line", ""))
     tcp_forward(msg)
 
 
@@ -417,12 +447,11 @@ def _handle_hub_boot(msg):
     global _hub_state
     _hub_state = "BOOTING"
     count = msg.get("sensor_count", 0)
-    unit  = msg.get("unit_state", "?")
-    ts    = msg.get("ts_utc", "?")
-    print("HUB BOOT: sensor_count={} unit_state={} ts={}".format(count, unit, ts))
-    # Re-push config whenever hub reboots
-    hub_cmd_push_config()
-    utime.sleep_ms(100)
+    print("HUB BOOT: sensor_count={} unit_state={} ts={}".format(
+          count, msg.get("unit_state", "?"), msg.get("ts_utc", "?")))
+    # Re-push config with retry whenever hub reboots
+    _thread.start_new_thread(_hub_push_config_with_retry, ())
+    utime.sleep_ms(500)
     hub_cmd_get_config()
     tcp_forward(msg)
 
@@ -432,11 +461,15 @@ def _handle_hub_ready(msg):
     _hub_state = "READY"
     online  = msg.get("online_count", 0)
     offline = msg.get("offline_count", 0)
-    unit    = msg.get("unit_state", "?")
-    ts      = msg.get("ts_utc", "?")
     print("HUB READY: online={} offline={} unit={} ts={}".format(
-          online, offline, unit, ts))
+          online, offline, msg.get("unit_state", "?"), msg.get("ts_utc", "?")))
     tcp_forward(msg)
+    # If sensors are offline after pairing window, open a short re-pairing window
+    # so sensors can re-announce and get marked ONLINE
+    if offline > 0 and online == 0:
+        print("HUB READY: {} sensors offline — opening 30s re-pair window".format(offline))
+        utime.sleep_ms(500)
+        hub_cmd_start_pairing(30)
 
 
 _SENSOR_MSG_HANDLERS = {
@@ -495,6 +528,8 @@ def handle_scheduler_msg(msg):
 # ============================================================================
 
 def hub_cmd_push_config():
+    """Send set_config once. Does NOT track ACK."""
+    global _hub_config_ack_pending
     hub_cfg = conf.get("sensor_hub_config", {})
     payload = {
         "type":                      "set_config",
@@ -505,8 +540,31 @@ def hub_cmd_push_config():
         "door_alarm_threshold_min":  hub_cfg.get("door_alarm_threshold_min",   10),
         "heartbeat_interval_min":    hub_cfg.get("heartbeat_interval_min",     30),
     }
+    _hub_config_ack_pending = True
     send_to_sensor_hub(payload)
     print("MASTER -> SENSORHUB: set_config sent")
+
+
+def _hub_push_config_with_retry():
+    """
+    Send set_config to Hub and retry up to HUB_CONFIG_RETRIES times
+    if no ACK is received. Runs in its own thread.
+    This handles the UART noise problem — if the first transmission
+    is corrupted by Zigbee radio interference, a retry will succeed
+    once the radio settles.
+    """
+    global _hub_config_ack_pending
+    for attempt in range(HUB_CONFIG_RETRIES):
+        hub_cmd_push_config()
+        # Wait for ACK — check every 100ms for up to HUB_CONFIG_RETRY_MS
+        deadline = utime.ticks_add(utime.ticks_ms(), HUB_CONFIG_RETRY_MS)
+        while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
+            if not _hub_config_ack_pending:
+                print("HUB CONFIG: ACK received on attempt {}".format(attempt + 1))
+                return
+            utime.sleep_ms(100)
+        print("HUB CONFIG: no ACK on attempt {} — retrying".format(attempt + 1))
+    print("HUB CONFIG: all {} attempts exhausted".format(HUB_CONFIG_RETRIES))
 
 
 def hub_cmd_set_sensor_name(sensor_index, name):
@@ -623,6 +681,7 @@ def handle_tcp_command(msg):
                 conf["last_decided_status"]      = status
                 save_config()
             send_status_to_scheduler(status)
+            tcp_forward({"type": "unit_state_update", "status": status})
             _tcp_send_ack("force_status")
             print("FORCE STATUS: {}".format(status))
         else:
@@ -632,12 +691,13 @@ def handle_tcp_command(msg):
         with _state_lock:
             state["pending_status"]      = None
             state["pending_apply_epoch"] = 0
+        tcp_forward({"type": "pending_update", "pending_status": None})
         _tcp_send_ack("cancel_pending")
         print("PENDING cancelled by debugger")
 
     elif t == "set_unit_config":
-        for key in ("tenant_id", "unit_id", "check_in_utc",
-                    "check_out_utc", "buffer_minutes"):
+        for key in ("tenant_id", "unit_id", "check_in_utc", "check_out_utc",
+                    "buffer_minutes"):
             if key in msg:
                 val = msg[key]
                 if key == "buffer_minutes":
@@ -651,6 +711,8 @@ def handle_tcp_command(msg):
             recalc_and_act()
         _tcp_send_ack("set_unit_config")
         print("UNIT CONFIG updated from debugger")
+        # Send updated snapshot so debugger reflects new state immediately
+        tcp_forward(build_state_snapshot())
 
     elif t == "set_hub_config":
         hub_cfg = conf.get("sensor_hub_config", {})
@@ -666,9 +728,11 @@ def handle_tcp_command(msg):
             hub_cfg["watchdog_enable"] = bool(msg["watchdog_enable"])
         conf["sensor_hub_config"] = hub_cfg
         save_config()
-        hub_cmd_push_config()
+        # Push with retry in background so UART noise doesn't silently lose it
+        _thread.start_new_thread(_hub_push_config_with_retry, ())
         _tcp_send_ack("set_hub_config")
-        print("HUB CONFIG updated and pushed from debugger")
+        print("HUB CONFIG updated and pushing to Hub (with retry)")
+        tcp_forward(build_state_snapshot())
 
     elif t == "set_wifi_config":
         ssid = msg.get("wifi_ssid", "")
@@ -693,12 +757,19 @@ def handle_tcp_command(msg):
     elif t == "scheduler_restart":
         send_to_scheduler({"type": "restart"})
         _tcp_send_ack("scheduler_restart")
-        print("MASTER -> SCHED: restart")
 
     elif t == "scheduler_factory_reset":
         send_to_scheduler({"type": "factory_reset"})
         _tcp_send_ack("scheduler_factory_reset")
-        print("MASTER -> SCHED: factory_reset")
+
+    elif t == "ntp_sync":
+        # Manual NTP re-sync from debugger
+        ok = _sync_ntp()
+        _tcp_send_ack("ntp_sync", "ok" if ok else "error")
+        if ok:
+            with _state_lock:
+                recalc_and_act()
+            tcp_forward(build_state_snapshot())
 
     else:
         print("WARN: unknown TCP command '{}'".format(t))
@@ -782,23 +853,39 @@ def sched_rx_loop():
                 if data:
                     for b in data:
                         ch = b if isinstance(b, int) else ord(b)
+
+                        # Non-printable noise filter
+                        if ch < 0x20 and ch != 0x09 and ch != 0x0A and ch != 0x0D:
+                            if _rx_sched_pos > 0:
+                                print("WARN: sched RX noise 0x{:02x} — buf reset".format(ch))
+                                _rx_sched_pos = 0
+                            continue
+
                         if ch == ord('\r'):
                             continue
+
                         if ch == ord('\n'):
                             if _rx_sched_pos > 0:
-                                _process_uart_line(
-                                    memoryview(_rx_sched_buf)[:_rx_sched_pos],
-                                    handle_scheduler_msg)
-                                _rx_sched_pos = 0
+                                if _rx_sched_buf[0] != ord('{'):
+                                    print("WARN: sched RX non-JSON discarded "
+                                          "(starts 0x{:02x})".format(_rx_sched_buf[0]))
+                                    _rx_sched_pos = 0
+                                else:
+                                    _process_uart_line(
+                                        memoryview(_rx_sched_buf)[:_rx_sched_pos],
+                                        handle_scheduler_msg)
+                                    _rx_sched_pos = 0
                         else:
                             if _rx_sched_pos >= UART_RX_BUF_MAX - 1:
                                 print("WARN: sched RX buf overflow — discarding")
                                 _rx_sched_pos = 0
-                            _rx_sched_buf[_rx_sched_pos] = ch
-                            _rx_sched_pos += 1
+                            else:
+                                _rx_sched_buf[_rx_sched_pos] = ch
+                                _rx_sched_pos += 1
             utime.sleep_ms(30)
         except Exception as e:
             print("sched_rx_loop error:", repr(e))
+            _rx_sched_pos = 0
             utime.sleep_ms(200)
 
 
@@ -824,6 +911,7 @@ def pending_worker():
                             print("PENDING cancelled — conditions changed")
                         state["pending_status"]      = None
                         state["pending_apply_epoch"] = 0
+                        tcp_forward({"type": "pending_update", "pending_status": None})
             utime.sleep(1)
         except Exception as e:
             print("pending_worker error:", repr(e))
@@ -835,10 +923,6 @@ def pending_worker():
 # ============================================================================
 
 def tcp_server_thread():
-    """
-    Listens on TCP_PORT. Accepts one client at a time.
-    Sends state_snapshot on connect. Forwards all commands to handle_tcp_command().
-    """
     global _tcp_client
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -852,7 +936,6 @@ def tcp_server_thread():
     while True:
         try:
             conn, addr = srv.accept()
-            # Drop old client if any
             old = _tcp_client
             _tcp_client = conn
             if old:
@@ -861,7 +944,6 @@ def tcp_server_thread():
                 except Exception:
                     pass
             print("DEBUG: client connected from {}".format(addr))
-            # Send snapshot immediately
             tcp_forward(build_state_snapshot())
             rx_pos = 0
 
@@ -907,11 +989,10 @@ def tcp_server_thread():
 
 
 # ============================================================================
-# INTERNET CONNECTIVITY CHECK
+# INTERNET + NTP
 # ============================================================================
 
 def _check_internet():
-    """Try a TCP connect to 8.8.8.8:53. Returns True if reachable."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(INTERNET_CHECK_TIMEOUT_S)
@@ -924,38 +1005,28 @@ def _check_internet():
 
 
 def _set_internet_up(new_state):
-    """Update internet flag and notify debugger if state changed."""
     global _internet_up
     changed = (_internet_up != new_state)
     _internet_up = new_state
     if changed:
-        status_str = "up" if new_state else "down"
-        label      = "RESTORED" if new_state else "LOST"
+        label = "RESTORED" if new_state else "LOST"
         print("INTERNET: connectivity {}".format(label))
-        tcp_forward({"type": "internet_status", "status": status_str})
-        # Re-evaluate unit state whenever internet status changes
+        tcp_forward({"type": "internet_status",
+                     "status": "up" if new_state else "down"})
         with _state_lock:
             recalc_and_act()
 
 
 def wifi_and_internet_thread():
-    """
-    1. Connect WiFi. If no credentials → 2-state fallback immediately.
-    2. Once WiFi up → check internet.
-    3. If internet confirmed → 4-state, call recalc_and_act().
-    4. If internet not reachable after retries → 2-state fallback, call recalc_and_act().
-    5. Re-check internet every INTERNET_RECHECK_S seconds forever.
-    """
-    global _wifi_ip, _internet_up
+    global _wifi_ip, _ntp_synced, _last_ntp_sync
 
     ssid = conf.get("wifi_ssid", "")
     pwd  = conf.get("wifi_password", "")
 
     if not ssid:
-        print("WIFI: no credentials configured — 2-state fallback")
+        print("WIFI: no credentials — 2-state fallback")
         with _state_lock:
             recalc_and_act()
-        # Still start re-check loop in case credentials are added later
         while True:
             utime.sleep(INTERNET_RECHECK_S)
 
@@ -964,7 +1035,6 @@ def wifi_and_internet_thread():
     print("WIFI: connecting to '{}'...".format(ssid))
     wlan.connect(ssid, pwd)
 
-    # Wait up to 30 seconds for WiFi
     deadline = utime.ticks_add(utime.ticks_ms(), 30000)
     while not wlan.isconnected():
         if utime.ticks_diff(deadline, utime.ticks_ms()) <= 0:
@@ -972,10 +1042,9 @@ def wifi_and_internet_thread():
         utime.sleep_ms(500)
 
     if not wlan.isconnected():
-        print("WIFI: failed to connect — 2-state fallback")
+        print("WIFI: failed — 2-state fallback")
         with _state_lock:
             recalc_and_act()
-        # Retry WiFi forever
         while True:
             utime.sleep(30)
             try:
@@ -989,7 +1058,6 @@ def wifi_and_internet_thread():
                     cfg_info = wlan.ifconfig()
                     _wifi_ip = cfg_info[0]
                     print("WIFI: connected IP={}".format(_wifi_ip))
-                    # Start TCP server now
                     _thread.start_new_thread(tcp_server_thread, ())
                     break
             except Exception as e:
@@ -1003,11 +1071,9 @@ def wifi_and_internet_thread():
         print("  Subnet  :", cfg_info[1])
         print("  Gateway :", cfg_info[2])
         print("  DNS     :", cfg_info[3])
-        # Start TCP server
         _thread.start_new_thread(tcp_server_thread, ())
 
-    # Internet check loop
-    # First check — up to 3 retries spaced 2s apart before falling back
+    # Internet check
     retries = 3
     internet_found = False
     for attempt in range(retries):
@@ -1018,17 +1084,21 @@ def wifi_and_internet_thread():
         utime.sleep(2)
 
     if internet_found:
-        print("INTERNET: connectivity CONFIRMED — switching to 4-state")
+        print("INTERNET: connectivity CONFIRMED")
+        # Attempt NTP sync immediately
+        for ntp_attempt in range(3):
+            if _sync_ntp():
+                break
+            print("NTP: attempt {}/3 failed — retrying in 5s".format(ntp_attempt + 1))
+            utime.sleep(5)
         _set_internet_up(True)
     else:
-        print("INTERNET: no connectivity after {} attempts — 2-state fallback".format(retries))
+        print("INTERNET: no connectivity — 2-state fallback")
         _set_internet_up(False)
-        # recalc already called in _set_internet_up via changed path,
-        # but if _internet_up was already False (first boot), call explicitly
         with _state_lock:
             recalc_and_act()
 
-    # Periodic re-check forever
+    # Periodic re-check + NTP re-sync
     while True:
         utime.sleep(INTERNET_RECHECK_S)
         if not wlan.isconnected():
@@ -1036,6 +1106,11 @@ def wifi_and_internet_thread():
             continue
         result = _check_internet()
         _set_internet_up(result)
+        # Re-sync NTP every NTP_SYNC_INTERVAL_S
+        if result and _ntp_synced:
+            elapsed = utime.ticks_diff(utime.ticks_ms(), _last_ntp_sync)
+            if elapsed >= NTP_SYNC_INTERVAL_S * 1000:
+                _sync_ntp()
 
 
 # ============================================================================
@@ -1048,7 +1123,6 @@ state["last_sensor_status"]     = str(conf.get("last_sensor_status", "vacant")).
 state["last_scheduler_status"]  = conf.get("last_scheduler_status", None)
 state["current_decided_status"] = None  # Force first send on boot
 
-# MAC address
 try:
     import ubinascii
     wlan_tmp = network.WLAN(network.STA_IF)
@@ -1060,27 +1134,24 @@ except Exception:
 print("=" * 50)
 print("MASTER started")
 print("MASTER MAC address  :", _mac_str)
-print("UTC epoch     :", now_epoch_utc())
 print("check_in_utc  :", conf.get("check_in_utc"))
 print("check_out_utc :", conf.get("check_out_utc"))
 print("buffer_minutes:", conf.get("buffer_minutes"))
 print("tenant_id     :", conf.get("tenant_id"))
 print("unit_id       :", conf.get("unit_id"))
-print("Internet mode : waiting for connectivity...")
+print("Internet mode : waiting for connectivity + NTP sync...")
 print("=" * 50)
 
-# Push sensor hub config on boot — before WiFi starts
+# Push hub config with retry (background thread — doesn't block boot)
 utime.sleep_ms(500)
-hub_cmd_push_config()
-utime.sleep_ms(200)
+_thread.start_new_thread(_hub_push_config_with_retry, ())
+utime.sleep_ms(300)
 hub_cmd_get_config()
 
-# Apply last persisted status to Scheduler immediately on boot.
-# Do NOT recalc yet — wait for internet check result.
+# Apply last persisted status — do NOT recalc until NTP confirmed
 _boot_status = conf.get("last_decided_status", "Vacant")
 state["current_decided_status"] = _boot_status
-send_status_to_scheduler(_boot_status)
-print("BOOT: applying last known status to Scheduler: {}".format(_boot_status))
+print("BOOT: last known status = {}".format(_boot_status))
 
 # Start background threads
 _thread.start_new_thread(sensor_rx_loop, ())
