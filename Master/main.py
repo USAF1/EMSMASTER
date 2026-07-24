@@ -5,6 +5,12 @@
 # UART2 <-> Scheduler   (TX=GPIO18, RX=GPIO21) — Scheduler UART disabled until Phase 4
 # TCP   <-> Debugger App (port 8765)
 #
+# Boot sequence (Section 9 of architecture doc):
+#   Master boots → starts UART RX listener → waits for hub_boot from Hub
+#   hub_boot arrives (before Zigbee radio starts) → send set_config immediately
+#   ACK received → send get_config → Hub responds with config_response
+#   WiFi + NTP run in parallel background thread
+#
 # Production rules applied:
 #   - Pre-allocated fixed bytearray RX buffers (no unbounded growth)
 #   - All JSON built as dict then serialised once
@@ -28,17 +34,16 @@ import master_config as cfg
 # CONSTANTS
 # ============================================================================
 
-UART_RX_BUF_MAX      = 512
-MAIN_LOOP_TICK_MS    = 1000
-TCP_PORT             = 8765
-TCP_RX_BUF_MAX       = 1024
-INTERNET_CHECK_HOST  = "8.8.8.8"
-INTERNET_CHECK_PORT  = 53
-INTERNET_CHECK_TIMEOUT_S = 3
-INTERNET_RECHECK_S   = 60
-NTP_SYNC_INTERVAL_S  = 3600        # re-sync NTP every hour
-HUB_CONFIG_RETRIES   = 3           # how many times to retry set_config to Hub
-HUB_CONFIG_RETRY_MS  = 2000        # ms between retries
+UART_RX_BUF_MAX       = 512
+MAIN_LOOP_TICK_MS     = 1000
+TCP_PORT              = 8765
+TCP_RX_BUF_MAX        = 1024
+INTERNET_CHECK_HOST   = "8.8.8.8"
+INTERNET_CHECK_PORT   = 53
+INTERNET_CHECK_TIMEOUT_S  = 3
+INTERNET_RECHECK_S    = 60
+NTP_SYNC_INTERVAL_S   = 3600       # re-sync NTP every hour
+HUB_CONFIG_ACK_TIMEOUT_MS = 3000  # how long to wait for set_config ACK
 
 # ============================================================================
 # UART INITIALISATION
@@ -90,7 +95,7 @@ _mac_str         = ""
 _ntp_synced      = False       # True once NTP has set the RTC
 _last_ntp_sync   = 0           # ticks_ms of last successful NTP sync
 
-# Pending ACK tracking for hub set_config
+# Hub config ACK tracking
 _hub_config_ack_pending = False
 
 # ============================================================================
@@ -155,7 +160,6 @@ def send_to_sensor_hub(payload_dict):
 
 def send_to_scheduler(payload_dict):
     # Phase 4 — Scheduler UART sends disabled for now
-    # _uart_send(uart_sched, _tx_sched_lock, payload_dict)
     print("SCHED TX (disabled): {}".format(payload_dict.get("type", "?")))
 
 
@@ -216,7 +220,7 @@ def parse_utc_to_epoch(dt_str):
 
 
 def now_epoch_utc():
-    """Return current UTC epoch. Uses real RTC if NTP synced, else fallback."""
+    """Return current UTC epoch. Real time after NTP sync."""
     return utime.time()
 
 
@@ -230,13 +234,13 @@ def in_booking_window(now_ep, checkin_ep, checkout_ep):
 
 def decide_status(sensor_status, now_ep):
     """
-    2-state fallback when internet is down — booking window not trusted.
-    4-state full logic when internet is confirmed AND NTP is synced.
+    2-state fallback until internet confirmed AND NTP synced.
+    4-state full logic when both conditions are met.
     """
     if not _internet_up or not _ntp_synced:
         result = "Occupied" if sensor_status == "occupied" else "Vacant"
         reason = "no internet" if not _internet_up else "NTP not synced"
-        print("DECIDE [2-state fallback — {}]: sensor={} => {}".format(
+        print("DECIDE [2-state — {}]: sensor={} => {}".format(
               reason, sensor_status, result))
         return result
 
@@ -259,7 +263,6 @@ def decide_status(sensor_status, now_ep):
 # ============================================================================
 
 def send_status_to_scheduler(status):
-    # Phase 4 disabled — just log
     print("MASTER -> SCHED (disabled): set_status={}".format(status))
 
 
@@ -269,7 +272,6 @@ def apply_immediate(status, force_send=False):
         conf["last_decided_status"] = status
         save_config()
         send_status_to_scheduler(status)
-        # Notify debugger of state change
         tcp_forward({"type": "unit_state_update", "status": status})
     else:
         print("STATUS unchanged: {}".format(status))
@@ -286,7 +288,6 @@ def schedule_buffered(status, now_ep):
     state["pending_apply_epoch"] = now_ep + buffer_min * 60
     print("BUFFERED: target={} apply_at={} now={}".format(
           status, state["pending_apply_epoch"], now_ep))
-    # Notify debugger of pending change
     tcp_forward({"type": "pending_update",
                  "pending_status": status,
                  "apply_at_epoch": state["pending_apply_epoch"]})
@@ -306,7 +307,7 @@ def recalc_and_act():
 
 
 # ============================================================================
-# STATE SNAPSHOT — sent to debugger on connect or get_state
+# STATE SNAPSHOT
 # ============================================================================
 
 def build_state_snapshot():
@@ -337,13 +338,72 @@ def build_state_snapshot():
 
 
 # ============================================================================
+# HUB CONFIG SEND — called when hub_boot arrives (radio not yet started)
+# ============================================================================
+
+def hub_cmd_push_config():
+    """
+    Send set_config to Hub.
+    Sets _hub_config_ack_pending = True.
+    ACK clears it in _handle_ack().
+    """
+    global _hub_config_ack_pending
+    hub_cfg = conf.get("sensor_hub_config", {})
+    payload = {
+        "type":                      "set_config",
+        "pairing_duration_sec":      hub_cfg.get("pairing_duration_sec",      120),
+        "watchdog_enable":           hub_cfg.get("watchdog_enable",            True),
+        "watchdog_interval_min":     hub_cfg.get("watchdog_interval_min",      60),
+        "watchdog_ping_timeout_sec": hub_cfg.get("watchdog_ping_timeout_sec",  30),
+        "door_alarm_threshold_min":  hub_cfg.get("door_alarm_threshold_min",   10),
+        "heartbeat_interval_min":    hub_cfg.get("heartbeat_interval_min",     30),
+    }
+    _hub_config_ack_pending = True
+    send_to_sensor_hub(payload)
+    print("MASTER -> SENSORHUB: set_config sent")
+
+
+def _hub_push_config_and_wait():
+    """
+    Called from hub_boot handler in a new thread.
+    Sends set_config and waits for ACK.
+    Since hub_boot arrives BEFORE Zigbee radio starts,
+    this transmission has no radio interference — ACK should always arrive.
+    If ACK does not arrive within timeout, log a warning and continue.
+    After ACK (or timeout), send get_config to get sensor list.
+    """
+    global _hub_config_ack_pending
+
+    # Small delay to let hub_boot handler finish before we start TX
+    utime.sleep_ms(50)
+
+    hub_cmd_push_config()
+
+    # Wait for ACK — Hub should respond within ~100ms since radio is idle
+    deadline = utime.ticks_add(utime.ticks_ms(), HUB_CONFIG_ACK_TIMEOUT_MS)
+    while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
+        if not _hub_config_ack_pending:
+            print("HUB CONFIG: ACK received — config confirmed applied")
+            break
+        utime.sleep_ms(50)
+    else:
+        print("HUB CONFIG: WARNING — no ACK within {}ms".format(
+              HUB_CONFIG_ACK_TIMEOUT_MS))
+        print("HUB CONFIG: Hub will use NVS defaults or last saved config")
+
+    # Always send get_config regardless of ACK — get current sensor list
+    utime.sleep_ms(100)
+    hub_cmd_get_config()
+
+
+# ============================================================================
 # SENSOR HUB MESSAGE HANDLERS
 # ============================================================================
 
 def _handle_unit_occupancy(msg):
     raw = msg.get("state", "")
     if not isinstance(raw, str):
-        print("WARN unit_occupancy: state field missing or wrong type")
+        print("WARN unit_occupancy: state field missing")
         return
     s = raw.strip().upper()
     sensor_status = "occupied" if s == "OCCUPIED" else "vacant"
@@ -406,7 +466,6 @@ def _handle_heartbeat(msg):
 
 
 def _handle_config_response(msg):
-    global _hub_config_ack_pending
     sensors = msg.get("sensors", [])
     if not isinstance(sensors, list):
         return
@@ -431,10 +490,9 @@ def _handle_ack(msg):
     status = msg.get("status", "?")
     print("ACK: command={} status={} ts={}".format(
           cmd, status, msg.get("ts_utc", "?")))
-    # Mark config ACK received so retry loop stops
     if cmd == "set_config" and status == "ok":
         _hub_config_ack_pending = False
-        print("HUB CONFIG: ACK confirmed — config applied")
+        print("HUB CONFIG: ACK confirmed — config applied on Hub")
     tcp_forward(msg)
 
 
@@ -444,19 +502,29 @@ def _handle_log_response(msg):
 
 
 def _handle_hub_boot(msg):
+    """
+    Hub sends this immediately on app_main BEFORE Zigbee stack starts.
+    This is the correct window to send set_config — zero radio interference.
+    Architecture doc Section 9 step 7:
+      'Receive hub_boot from Sensor Hub — re-push config and get_config'
+    """
     global _hub_state
     _hub_state = "BOOTING"
     count = msg.get("sensor_count", 0)
     print("HUB BOOT: sensor_count={} unit_state={} ts={}".format(
           count, msg.get("unit_state", "?"), msg.get("ts_utc", "?")))
-    # Re-push config with retry whenever hub reboots
-    _thread.start_new_thread(_hub_push_config_with_retry, ())
-    utime.sleep_ms(500)
-    hub_cmd_get_config()
+    print("HUB BOOT: Hub UART ready, Zigbee not yet started — sending config now")
+    # Run in background thread so sensor_rx_loop is not blocked
+    _thread.start_new_thread(_hub_push_config_and_wait, ())
     tcp_forward(msg)
 
 
 def _handle_hub_ready(msg):
+    """
+    Hub sends this when pairing window closes.
+    Sensors that were already paired should have auto-rejoined during the
+    pairing window. If all are still offline, open a short 30s window.
+    """
     global _hub_state
     _hub_state = "READY"
     online  = msg.get("online_count", 0)
@@ -464,11 +532,14 @@ def _handle_hub_ready(msg):
     print("HUB READY: online={} offline={} unit={} ts={}".format(
           online, offline, msg.get("unit_state", "?"), msg.get("ts_utc", "?")))
     tcp_forward(msg)
-    # If sensors are offline after pairing window, open a short re-pairing window
-    # so sensors can re-announce and get marked ONLINE
+
+    # If all sensors are offline after pairing window, open a short
+    # re-pairing window. Sensors that have Zigbee keys will rejoin
+    # automatically — no button press needed (architecture doc Section 12.3).
     if offline > 0 and online == 0:
-        print("HUB READY: {} sensors offline — opening 30s re-pair window".format(offline))
-        utime.sleep_ms(500)
+        print("HUB READY: all {} sensors offline — opening 30s re-pair window".format(
+              offline))
+        utime.sleep_ms(300)
         hub_cmd_start_pairing(30)
 
 
@@ -526,46 +597,6 @@ def handle_scheduler_msg(msg):
 # ============================================================================
 # SENSOR HUB COMMAND SENDERS
 # ============================================================================
-
-def hub_cmd_push_config():
-    """Send set_config once. Does NOT track ACK."""
-    global _hub_config_ack_pending
-    hub_cfg = conf.get("sensor_hub_config", {})
-    payload = {
-        "type":                      "set_config",
-        "pairing_duration_sec":      hub_cfg.get("pairing_duration_sec",      120),
-        "watchdog_enable":           hub_cfg.get("watchdog_enable",            True),
-        "watchdog_interval_min":     hub_cfg.get("watchdog_interval_min",      60),
-        "watchdog_ping_timeout_sec": hub_cfg.get("watchdog_ping_timeout_sec",  30),
-        "door_alarm_threshold_min":  hub_cfg.get("door_alarm_threshold_min",   10),
-        "heartbeat_interval_min":    hub_cfg.get("heartbeat_interval_min",     30),
-    }
-    _hub_config_ack_pending = True
-    send_to_sensor_hub(payload)
-    print("MASTER -> SENSORHUB: set_config sent")
-
-
-def _hub_push_config_with_retry():
-    """
-    Send set_config to Hub and retry up to HUB_CONFIG_RETRIES times
-    if no ACK is received. Runs in its own thread.
-    This handles the UART noise problem — if the first transmission
-    is corrupted by Zigbee radio interference, a retry will succeed
-    once the radio settles.
-    """
-    global _hub_config_ack_pending
-    for attempt in range(HUB_CONFIG_RETRIES):
-        hub_cmd_push_config()
-        # Wait for ACK — check every 100ms for up to HUB_CONFIG_RETRY_MS
-        deadline = utime.ticks_add(utime.ticks_ms(), HUB_CONFIG_RETRY_MS)
-        while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
-            if not _hub_config_ack_pending:
-                print("HUB CONFIG: ACK received on attempt {}".format(attempt + 1))
-                return
-            utime.sleep_ms(100)
-        print("HUB CONFIG: no ACK on attempt {} — retrying".format(attempt + 1))
-    print("HUB CONFIG: all {} attempts exhausted".format(HUB_CONFIG_RETRIES))
-
 
 def hub_cmd_set_sensor_name(sensor_index, name):
     if not isinstance(sensor_index, int) or sensor_index < 0:
@@ -626,7 +657,6 @@ def _tcp_send_ack(command, status="ok"):
 
 
 def handle_tcp_command(msg):
-    """Dispatch a command dict received from the TCP debugger client."""
     t = msg.get("type", "")
 
     if t == "get_state":
@@ -711,7 +741,6 @@ def handle_tcp_command(msg):
             recalc_and_act()
         _tcp_send_ack("set_unit_config")
         print("UNIT CONFIG updated from debugger")
-        # Send updated snapshot so debugger reflects new state immediately
         tcp_forward(build_state_snapshot())
 
     elif t == "set_hub_config":
@@ -728,10 +757,10 @@ def handle_tcp_command(msg):
             hub_cfg["watchdog_enable"] = bool(msg["watchdog_enable"])
         conf["sensor_hub_config"] = hub_cfg
         save_config()
-        # Push with retry in background so UART noise doesn't silently lose it
-        _thread.start_new_thread(_hub_push_config_with_retry, ())
+        # Push config in background thread — same timing-safe path as boot
+        _thread.start_new_thread(_hub_push_config_and_wait, ())
         _tcp_send_ack("set_hub_config")
-        print("HUB CONFIG updated and pushing to Hub (with retry)")
+        print("HUB CONFIG updated and pushing to Hub")
         tcp_forward(build_state_snapshot())
 
     elif t == "set_wifi_config":
@@ -763,7 +792,6 @@ def handle_tcp_command(msg):
         _tcp_send_ack("scheduler_factory_reset")
 
     elif t == "ntp_sync":
-        # Manual NTP re-sync from debugger
         ok = _sync_ntp()
         _tcp_send_ack("ntp_sync", "ok" if ok else "error")
         if ok:
@@ -809,7 +837,6 @@ def sensor_rx_loop():
                     for b in data:
                         ch = b if isinstance(b, int) else ord(b)
 
-                        # Non-printable noise filter
                         if ch < 0x20 and ch != 0x09 and ch != 0x0A and ch != 0x0D:
                             if _rx_sensor_pos > 0:
                                 print("WARN: sensor RX noise 0x{:02x} — buf reset".format(ch))
@@ -822,8 +849,8 @@ def sensor_rx_loop():
                         if ch == ord('\n'):
                             if _rx_sensor_pos > 0:
                                 if _rx_sensor_buf[0] != ord('{'):
-                                    print("WARN: sensor RX non-JSON discarded "
-                                          "(starts 0x{:02x})".format(_rx_sensor_buf[0]))
+                                    print("WARN: sensor RX non-JSON (starts 0x{:02x})".format(
+                                          _rx_sensor_buf[0]))
                                     _rx_sensor_pos = 0
                                 else:
                                     _process_uart_line(
@@ -854,7 +881,6 @@ def sched_rx_loop():
                     for b in data:
                         ch = b if isinstance(b, int) else ord(b)
 
-                        # Non-printable noise filter
                         if ch < 0x20 and ch != 0x09 and ch != 0x0A and ch != 0x0D:
                             if _rx_sched_pos > 0:
                                 print("WARN: sched RX noise 0x{:02x} — buf reset".format(ch))
@@ -867,8 +893,8 @@ def sched_rx_loop():
                         if ch == ord('\n'):
                             if _rx_sched_pos > 0:
                                 if _rx_sched_buf[0] != ord('{'):
-                                    print("WARN: sched RX non-JSON discarded "
-                                          "(starts 0x{:02x})".format(_rx_sched_buf[0]))
+                                    print("WARN: sched RX non-JSON (starts 0x{:02x})".format(
+                                          _rx_sched_buf[0]))
                                     _rx_sched_pos = 0
                                 else:
                                     _process_uart_line(
@@ -1085,7 +1111,6 @@ def wifi_and_internet_thread():
 
     if internet_found:
         print("INTERNET: connectivity CONFIRMED")
-        # Attempt NTP sync immediately
         for ntp_attempt in range(3):
             if _sync_ntp():
                 break
@@ -1106,7 +1131,6 @@ def wifi_and_internet_thread():
             continue
         result = _check_internet()
         _set_internet_up(result)
-        # Re-sync NTP every NTP_SYNC_INTERVAL_S
         if result and _ntp_synced:
             elapsed = utime.ticks_diff(utime.ticks_ms(), _last_ntp_sync)
             if elapsed >= NTP_SYNC_INTERVAL_S * 1000:
@@ -1121,7 +1145,7 @@ load_config()
 
 state["last_sensor_status"]     = str(conf.get("last_sensor_status", "vacant")).lower()
 state["last_scheduler_status"]  = conf.get("last_scheduler_status", None)
-state["current_decided_status"] = None  # Force first send on boot
+state["current_decided_status"] = None
 
 try:
     import ubinascii
@@ -1133,27 +1157,25 @@ except Exception:
 
 print("=" * 50)
 print("MASTER started")
-print("MASTER MAC address  :", _mac_str)
-print("check_in_utc  :", conf.get("check_in_utc"))
-print("check_out_utc :", conf.get("check_out_utc"))
-print("buffer_minutes:", conf.get("buffer_minutes"))
-print("tenant_id     :", conf.get("tenant_id"))
-print("unit_id       :", conf.get("unit_id"))
-print("Internet mode : waiting for connectivity + NTP sync...")
+print("MASTER MAC  :", _mac_str)
+print("check_in_utc:", conf.get("check_in_utc"))
+print("check_out_utc:", conf.get("check_out_utc"))
+print("buffer_min  :", conf.get("buffer_minutes"))
+print("tenant_id   :", conf.get("tenant_id"))
+print("unit_id     :", conf.get("unit_id"))
+print("Boot mode   : waiting for hub_boot from Sensor Hub...")
+print("Internet    : waiting for connectivity + NTP sync...")
 print("=" * 50)
-
-# Push hub config with retry (background thread — doesn't block boot)
-utime.sleep_ms(500)
-_thread.start_new_thread(_hub_push_config_with_retry, ())
-utime.sleep_ms(300)
-hub_cmd_get_config()
 
 # Apply last persisted status — do NOT recalc until NTP confirmed
 _boot_status = conf.get("last_decided_status", "Vacant")
 state["current_decided_status"] = _boot_status
-print("BOOT: last known status = {}".format(_boot_status))
+print("BOOT: last known status = {} (held until hub_boot + NTP confirmed)".format(
+      _boot_status))
 
 # Start background threads
+# NOTE: Do NOT send set_config here. Wait for hub_boot to arrive.
+# hub_boot arrives BEFORE Zigbee radio starts — that is the safe TX window.
 _thread.start_new_thread(sensor_rx_loop, ())
 _thread.start_new_thread(sched_rx_loop, ())
 _thread.start_new_thread(pending_worker, ())

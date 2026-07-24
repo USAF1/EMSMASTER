@@ -10,8 +10,8 @@
 # ============================================================================
 
 SENSOR_UART_ID = 1
-SENSOR_UART_TX = 16
-SENSOR_UART_RX = 17
+SENSOR_UART_TX = 4
+SENSOR_UART_RX = 5
 SENSOR_UART_BAUD = 115200
 
 SCHED_UART_ID = 2
