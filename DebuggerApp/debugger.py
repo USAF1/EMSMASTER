@@ -29,26 +29,27 @@ from datetime import datetime
 # CONFIGURATION
 # ============================================================================
 
-DEFAULT_IP   = "192.168.0.211"
-DEFAULT_PORT = 8765
-RECONNECT_INTERVAL_S = 5
+DEFAULT_IP            = "192.168.0.211"
+DEFAULT_PORT          = 8765
+RECONNECT_INTERVAL_S  = 5
+RELAY_NO_DATA_TIMEOUT = 10   # seconds before "waiting for Scheduler" shown
 
 # ============================================================================
 # COLOURS — dark theme
 # ============================================================================
 
-C_BG        = "#1e1e2e"
-C_PANEL     = "#2a2a3e"
-C_BORDER    = "#44475a"
-C_TEXT      = "#cdd6f4"
-C_DIM       = "#6c7086"
-C_GREEN     = "#a6e3a1"
-C_RED       = "#f38ba8"
-C_YELLOW    = "#f9e2af"
-C_BLUE      = "#89b4fa"
-C_ORANGE    = "#fab387"
-C_PURPLE    = "#cba6f7"
-C_TEAL      = "#94e2d5"
+C_BG     = "#1e1e2e"
+C_PANEL  = "#2a2a3e"
+C_BORDER = "#44475a"
+C_TEXT   = "#cdd6f4"
+C_DIM    = "#6c7086"
+C_GREEN  = "#a6e3a1"
+C_RED    = "#f38ba8"
+C_YELLOW = "#f9e2af"
+C_BLUE   = "#89b4fa"
+C_ORANGE = "#fab387"
+C_PURPLE = "#cba6f7"
+C_TEAL   = "#94e2d5"
 
 STATUS_COLOURS = {
     "Occupied":        C_GREEN,
@@ -60,8 +61,6 @@ STATUS_COLOURS = {
 
 # ============================================================================
 # TCP CLIENT
-# Runs in a background thread.
-# All messages are passed to the UI via a thread-safe queue.
 # ============================================================================
 
 class TcpClient:
@@ -144,8 +143,9 @@ class TcpClient:
             if self._running:
                 time.sleep(RECONNECT_INTERVAL_S)
 
+
 # ============================================================================
-# HELPER — create a styled LabelFrame
+# HELPERS
 # ============================================================================
 
 def make_frame(parent, title, row=0, col=0,
@@ -185,6 +185,7 @@ def make_button(parent, text, cmd, fg=C_TEXT,
              sticky=sticky, padx=padx, pady=pady)
     return btn
 
+
 # ============================================================================
 # MAIN APPLICATION
 # ============================================================================
@@ -196,14 +197,14 @@ class DebuggerApp:
         self.ip       = ip
         self.port     = port
         self._q       = queue.Queue()
-        self._sensors = {}
-        self._relays  = {}
+        self._sensors = {}          # str(idx) -> sensor dict
         self._hub_cfg = {}
+        self._last_relay_time = None  # time.monotonic() of last scheduler_update
 
         root.title(
             "Innovatsii EMS — Pico 1 Debugger  |  {}:{}".format(ip, port))
         root.configure(bg=C_BG)
-        root.geometry("1400x860")
+        root.geometry("1400x900")
         root.minsize(1100, 700)
 
         self._build_ui()
@@ -215,13 +216,13 @@ class DebuggerApp:
         )
         self._tcp.start()
         self._poll_queue()
+        self._check_relay_timeout()
 
     # -----------------------------------------------------------------------
     # UI BUILD
     # -----------------------------------------------------------------------
 
     def _build_ui(self):
-        # ---- Top status bar ----
         top = tk.Frame(self.root, bg=C_PANEL, height=56)
         top.pack(fill=tk.X)
         top.pack_propagate(False)
@@ -268,22 +269,19 @@ class DebuggerApp:
             font=("Segoe UI", 10))
         self._lbl_hub.pack(side=tk.RIGHT, padx=16)
 
-        # ---- Notebook ----
         style = ttk.Style()
         style.theme_use("default")
         style.configure("TNotebook", background=C_BG, borderwidth=0)
         style.configure("TNotebook.Tab",
                         background=C_PANEL, foreground=C_TEXT,
-                        padding=[14, 6],
-                        font=("Segoe UI", 10))
+                        padding=[14, 6], font=("Segoe UI", 10))
         style.map("TNotebook.Tab",
                   background=[("selected", C_BG)],
                   foreground=[("selected", C_BLUE)])
         style.configure("Treeview",
                         background=C_PANEL, foreground=C_TEXT,
                         fieldbackground=C_PANEL,
-                        rowheight=26,
-                        font=("Segoe UI", 10))
+                        rowheight=26, font=("Segoe UI", 10))
         style.configure("Treeview.Heading",
                         background=C_BORDER, foreground=C_TEXT,
                         font=("Segoe UI", 10, "bold"))
@@ -320,7 +318,6 @@ class DebuggerApp:
         p.columnconfigure(2, weight=1)
         p.rowconfigure(1, weight=1)
 
-        # Unit state card
         uf = make_frame(p, "Unit Occupancy State", row=0, col=0)
         uf.columnconfigure(0, weight=1)
 
@@ -335,7 +332,7 @@ class DebuggerApp:
         self._lbl_sensor_occ.grid(row=1, column=0, pady=2)
 
         self._lbl_inet_mode = tk.Label(
-            uf, text="Mode: 2-state (no internet)",
+            uf, text="Mode: waiting...",
             fg=C_YELLOW, bg=C_BG,
             font=("Segoe UI", 10))
         self._lbl_inet_mode.grid(row=2, column=0, pady=2)
@@ -345,7 +342,6 @@ class DebuggerApp:
             font=("Segoe UI", 10))
         self._lbl_pending2.grid(row=3, column=0, pady=2)
 
-        # Quick actions
         qf = make_frame(p, "Quick Actions", row=0, col=1)
         qf.columnconfigure(0, weight=1)
         for i, (label, status) in enumerate([
@@ -364,31 +360,24 @@ class DebuggerApp:
                     fg=C_YELLOW, row=4, col=0,
                     sticky="ew", padx=8, pady=6)
 
-        # Hub control
         hf = make_frame(p, "Sensor Hub Control", row=0, col=2)
         hf.columnconfigure(0, weight=1)
         make_button(hf, "Open Pairing (120s)",
                     lambda: self._start_pairing(120),
-                    fg=C_GREEN, row=0, col=0,
-                    sticky="ew", padx=8, pady=3)
+                    fg=C_GREEN, row=0, col=0, sticky="ew", padx=8, pady=3)
         make_button(hf, "Stop Pairing",
                     self._stop_pairing,
-                    fg=C_RED, row=1, col=0,
-                    sticky="ew", padx=8, pady=3)
+                    fg=C_RED, row=1, col=0, sticky="ew", padx=8, pady=3)
         make_button(hf, "Refresh Sensors",
                     self._get_sensor_config,
-                    fg=C_BLUE, row=2, col=0,
-                    sticky="ew", padx=8, pady=3)
+                    fg=C_BLUE, row=2, col=0, sticky="ew", padx=8, pady=3)
         make_button(hf, "Get Logs",
                     self._get_hub_logs,
-                    fg=C_DIM, row=3, col=0,
-                    sticky="ew", padx=8, pady=3)
+                    fg=C_DIM, row=3, col=0, sticky="ew", padx=8, pady=3)
         make_button(hf, "Restart Hub",
                     self._restart_hub,
-                    fg=C_YELLOW, row=4, col=0,
-                    sticky="ew", padx=8, pady=3)
+                    fg=C_YELLOW, row=4, col=0, sticky="ew", padx=8, pady=3)
 
-        # Live event feed
         ef = make_frame(p, "Live Events",
                         row=1, col=0, colspan=3, sticky="nsew")
         ef.columnconfigure(0, weight=1)
@@ -413,6 +402,7 @@ class DebuggerApp:
             ("inet",     C_ORANGE),
             ("dim",      C_DIM),
             ("info",     C_TEXT),
+            ("sched",    C_TEAL),
         ]:
             self._event_log.tag_config(tag, foreground=colour)
 
@@ -436,6 +426,9 @@ class DebuggerApp:
         make_button(bf, "Stop Pairing",
                     self._stop_pairing,
                     fg=C_RED, row=0, col=2, padx=4)
+        make_button(bf, "Remove Selected",
+                    self._remove_sensor,
+                    fg=C_RED, row=0, col=3, padx=4)
 
         cols = ("index", "name", "model", "role",
                 "online", "state", "battery", "temp", "hum")
@@ -448,7 +441,7 @@ class DebuggerApp:
             ("model",   "Model",  120),
             ("role",    "Role",    90),
             ("online",  "Online",  70),
-            ("state",   "State",   80),
+            ("state",   "State",   90),
             ("battery", "Battery", 70),
             ("temp",    "Temp °C", 80),
             ("hum",     "Hum %",   70),
@@ -459,12 +452,11 @@ class DebuggerApp:
 
         self._sensor_tree.grid(
             row=1, column=0, sticky="nsew", padx=8, pady=4)
-        self._sensor_tree.bind(
-            "<Double-1>", self._on_sensor_double_click)
+        self._sensor_tree.bind("<Double-1>", self._on_sensor_double_click)
 
         tk.Label(
             p,
-            text="Double-click a sensor to rename it.",
+            text="Double-click a sensor to rename it.  Select a row then click Remove to delete.",
             fg=C_DIM, bg=C_BG,
             font=("Segoe UI", 9)
         ).grid(row=2, column=0, sticky="w", padx=12, pady=2)
@@ -478,24 +470,22 @@ class DebuggerApp:
         RELAY_KEYS = ["R4","R5","R16","R17","R18",
                       "R21","R35","R36","R37","R38"]
 
-        # Configure each column individually — Python 3.14 compatible
         for i in range(len(RELAY_KEYS)):
             p.columnconfigure(i, weight=1)
 
-        tk.Label(
+        self._lbl_relay_header = tk.Label(
             p,
-            text="Live relay states — updated from Scheduler every 5 seconds",
-            fg=C_DIM, bg=C_BG,
-            font=("Segoe UI", 9)
-        ).grid(row=0, column=0,
-               columnspan=len(RELAY_KEYS),
-               sticky="w", padx=12, pady=6)
+            text="Waiting for Scheduler data...",
+            fg=C_YELLOW, bg=C_BG,
+            font=("Segoe UI", 9))
+        self._lbl_relay_header.grid(
+            row=0, column=0, columnspan=len(RELAY_KEYS),
+            sticky="w", padx=12, pady=6)
 
         self._relay_labels = {}
         for i, key in enumerate(RELAY_KEYS):
             frame = tk.Frame(p, bg=C_PANEL, bd=1, relief=tk.GROOVE)
-            frame.grid(row=1, column=i,
-                       sticky="nsew", padx=6, pady=8)
+            frame.grid(row=1, column=i, sticky="nsew", padx=6, pady=8)
             tk.Label(
                 frame, text=key,
                 fg=C_BLUE, bg=C_PANEL,
@@ -528,16 +518,15 @@ class DebuggerApp:
         p.columnconfigure(1, weight=1)
 
         # Unit & booking config
-        uf = make_frame(p, "Unit & Booking Configuration",
-                        row=0, col=0)
+        uf = make_frame(p, "Unit & Booking Configuration", row=0, col=0)
         uf.columnconfigure(1, weight=1)
 
         unit_fields = [
-            ("tenant_id",     "Tenant ID"),
-            ("unit_id",       "Unit ID"),
-            ("check_in_utc",  "Check-in UTC  (YYYY-MM-DD HH:MM:SS)"),
-            ("check_out_utc", "Check-out UTC (YYYY-MM-DD HH:MM:SS)"),
-            ("buffer_minutes","Buffer minutes"),
+            ("tenant_id",      "Tenant ID"),
+            ("unit_id",        "Unit ID"),
+            ("check_in_utc",   "Check-in UTC  (YYYY-MM-DD HH:MM:SS)"),
+            ("check_out_utc",  "Check-out UTC (YYYY-MM-DD HH:MM:SS)"),
+            ("buffer_minutes", "Buffer minutes"),
         ]
         self._cfg_entries = {}
         for r, (key, label) in enumerate(unit_fields):
@@ -550,8 +539,7 @@ class DebuggerApp:
                 uf, bg=C_PANEL, fg=C_TEXT,
                 insertbackground=C_TEXT,
                 font=("Segoe UI", 10), width=32)
-            e.grid(row=r, column=1,
-                   sticky="ew", padx=8, pady=4)
+            e.grid(row=r, column=1, sticky="ew", padx=8, pady=4)
             self._cfg_entries[key] = e
 
         make_button(uf, "Save Unit Config",
@@ -561,8 +549,7 @@ class DebuggerApp:
                     sticky="ew", padx=8, pady=8)
 
         # Hub config
-        hf = make_frame(p, "Sensor Hub Configuration",
-                        row=0, col=1)
+        hf = make_frame(p, "Sensor Hub Configuration", row=0, col=1)
         hf.columnconfigure(1, weight=1)
 
         hub_fields = [
@@ -583,8 +570,7 @@ class DebuggerApp:
                 hf, bg=C_PANEL, fg=C_TEXT,
                 insertbackground=C_TEXT,
                 font=("Segoe UI", 10), width=20)
-            e.grid(row=r, column=1,
-                   sticky="ew", padx=8, pady=4)
+            e.grid(row=r, column=1, sticky="ew", padx=8, pady=4)
             self._hub_entries[key] = e
 
         self._wd_enable_var = tk.BooleanVar(value=True)
@@ -622,8 +608,7 @@ class DebuggerApp:
                 insertbackground=C_TEXT,
                 font=("Segoe UI", 10), width=28,
                 show=show)
-            e.grid(row=r, column=1,
-                   sticky="ew", padx=8, pady=4)
+            e.grid(row=r, column=1, sticky="ew", padx=8, pady=4)
             self._cfg_entries[key] = e
 
         make_button(wf, "Save WiFi (reboot to apply)",
@@ -633,13 +618,9 @@ class DebuggerApp:
 
         tk.Label(
             wf,
-            text=(
-                "IP is assigned by router DHCP reservation.\n"
-                "MAC address is shown in the top bar on connection."
-            ),
+            text="IP is assigned by router DHCP reservation.",
             fg=C_DIM, bg=C_BG,
-            font=("Segoe UI", 9),
-            justify=tk.LEFT
+            font=("Segoe UI", 9), justify=tk.LEFT
         ).grid(row=3, column=0, columnspan=2,
                sticky="w", padx=8, pady=4)
 
@@ -648,16 +629,19 @@ class DebuggerApp:
         df.columnconfigure(0, weight=1)
         make_button(df, "Restart Master",
                     self._restart_master,
-                    fg=C_RED, row=0, col=0,
-                    sticky="ew", padx=8, pady=4)
+                    fg=C_RED, row=0, col=0, sticky="ew", padx=8, pady=4)
         make_button(df, "Restart Sensor Hub",
                     self._restart_hub,
-                    fg=C_ORANGE, row=1, col=0,
-                    sticky="ew", padx=8, pady=4)
+                    fg=C_ORANGE, row=1, col=0, sticky="ew", padx=8, pady=4)
         make_button(df, "Hub Factory Reset",
                     self._hub_factory_reset,
-                    fg=C_RED, row=2, col=0,
-                    sticky="ew", padx=8, pady=4)
+                    fg=C_RED, row=2, col=0, sticky="ew", padx=8, pady=4)
+        make_button(df, "Restart Scheduler",
+                    self._restart_scheduler,
+                    fg=C_ORANGE, row=3, col=0, sticky="ew", padx=8, pady=4)
+        make_button(df, "Scheduler Factory Reset",
+                    self._scheduler_factory_reset,
+                    fg=C_RED, row=4, col=0, sticky="ew", padx=8, pady=4)
 
     # -----------------------------------------------------------------------
     # LOGS TAB
@@ -681,9 +665,8 @@ class DebuggerApp:
             p, bg="#11111b", fg=C_TEXT,
             font=("Courier New", 9),
             state=tk.DISABLED, wrap=tk.WORD)
-        self._log_box.grid(
-            row=1, column=0,
-            sticky="nsew", padx=8, pady=4)
+        self._log_box.grid(row=1, column=0,
+                           sticky="nsew", padx=8, pady=4)
 
         for tag, colour in [
             ("error",   C_RED),
@@ -697,7 +680,7 @@ class DebuggerApp:
             self._log_box.tag_config(tag, foreground=colour)
 
     # -----------------------------------------------------------------------
-    # TCP CALLBACKS → queue → UI thread
+    # TCP CALLBACKS
     # -----------------------------------------------------------------------
 
     def _on_connect(self):
@@ -720,6 +703,22 @@ class DebuggerApp:
             pass
         self.root.after(50, self._poll_queue)
 
+    def _check_relay_timeout(self):
+        """Show warning on relay tab if no Scheduler data received yet."""
+        if self._last_relay_time is None:
+            self._lbl_relay_header.config(
+                text="Waiting for Scheduler data...", fg=C_YELLOW)
+        else:
+            elapsed = time.monotonic() - self._last_relay_time
+            if elapsed > RELAY_NO_DATA_TIMEOUT:
+                self._lbl_relay_header.config(
+                    text="No data — Scheduler may be offline", fg=C_RED)
+            else:
+                self._lbl_relay_header.config(
+                    text="Live relay states — updated from Scheduler every 5s",
+                    fg=C_DIM)
+        self.root.after(2000, self._check_relay_timeout)
+
     # -----------------------------------------------------------------------
     # UI EVENT HANDLERS
     # -----------------------------------------------------------------------
@@ -727,6 +726,7 @@ class DebuggerApp:
     def _ui_on_connect(self):
         self._lbl_conn.config(text="⬤  Connected", fg=C_GREEN)
         self._log("Connected to {}:{}".format(self.ip, self.port), "info")
+        # Request state snapshot only — no automatic get_sensor_config
         self._tcp.send({"type": "get_state"})
 
     def _ui_on_disconnect(self):
@@ -746,21 +746,18 @@ class DebuggerApp:
         elif t == "internet_status":
             up = msg.get("status", "") == "up"
             self._update_internet_indicator(up)
-            tag = "inet"
             self._log_event(
-                "INTERNET {}".format("RESTORED" if up else "LOST"), tag)
+                "INTERNET {}".format("RESTORED" if up else "LOST"), "inet")
 
         elif t == "unit_occupancy":
             s = msg.get("state", "VACANT")
-            self._log_event(
-                "UNIT OCCUPANCY → {}".format(s), "unit")
+            self._log_event("UNIT OCCUPANCY → {}".format(s), "unit")
 
         elif t == "hub_boot":
             count = msg.get("sensor_count", 0)
             self._log_event(
-                "HUB BOOTED — {} sensors".format(count), "hub")
-            self._lbl_hub.config(
-                text="Hub: BOOTING", fg=C_YELLOW)
+                "HUB BOOTED — {} sensors known".format(count), "hub")
+            self._lbl_hub.config(text="Hub: BOOTING", fg=C_YELLOW)
 
         elif t == "hub_ready":
             on  = msg.get("online_count",  0)
@@ -769,77 +766,81 @@ class DebuggerApp:
                 "HUB READY — online={} offline={}".format(on, off), "hub")
             self._lbl_hub.config(
                 text="Hub: READY ({} online)".format(on), fg=C_GREEN)
+            # Auto-refresh sensor list when hub is ready
             self._tcp.send({"type": "get_sensor_config"})
 
         elif t == "sensor_presence":
+            sensor = msg.get("sensor", "")
+            sv     = msg.get("state", "")
             self._log_event(
-                "PRESENCE  {}  {}".format(
-                    msg.get("sensor",""), msg.get("state","")),
-                "presence")
+                "PRESENCE  {}  {}".format(sensor, sv), "presence")
+            self._update_sensor_state_col(sensor, sv)
 
         elif t == "environment":
             tc  = msg.get("temp_c_x100",  0) / 100.0
             hum = msg.get("hum_pct_x100", 0) / 100.0
             self._log_event(
                 "ENV  {}  {:.1f}°C  {:.1f}%".format(
-                    msg.get("sensor",""), tc, hum),
-                "env")
-            self._update_sensor_env(msg.get("sensor",""), tc, hum)
+                    msg.get("sensor", ""), tc, hum), "env")
+            self._update_sensor_env(msg.get("sensor", ""), tc, hum)
 
         elif t == "door":
+            sensor = msg.get("sensor", "")
+            sv     = msg.get("state", "")
             self._log_event(
-                "DOOR  {}  {}".format(
-                    msg.get("sensor",""), msg.get("state","")),
-                "door")
+                "DOOR  {}  {}".format(sensor, sv), "door")
+            self._update_sensor_state_col(sensor, sv)
 
         elif t == "door_alarm":
             self._log_event(
                 "⚠ DOOR ALARM  {}  {}  {}s".format(
-                    msg.get("sensor",""),
-                    msg.get("state",""),
-                    msg.get("duration_sec", 0)),
-                "alarm")
+                    msg.get("sensor", ""),
+                    msg.get("state", ""),
+                    msg.get("duration_sec", 0)), "alarm")
 
         elif t == "sensor_health":
-            online = msg.get("state","") == "ONLINE"
+            online = msg.get("state", "") == "ONLINE"
             self._log_event(
                 "HEALTH  {}  {}".format(
-                    msg.get("sensor",""), msg.get("state","")),
-                "health")
-            self._update_sensor_health(msg.get("sensor",""), online)
+                    msg.get("sensor", ""), msg.get("state", "")), "health")
+            self._update_sensor_health(msg.get("sensor", ""), online)
 
         elif t == "battery":
             self._log_event(
                 "BATTERY  {}  {}%".format(
-                    msg.get("sensor",""), msg.get("battery_pct",0)),
-                "battery")
+                    msg.get("sensor", ""), msg.get("battery_pct", 0)), "battery")
             self._update_sensor_battery(
-                msg.get("sensor",""), msg.get("battery_pct",0))
+                msg.get("sensor", ""), msg.get("battery_pct", 0))
 
         elif t == "heartbeat":
             self._log_event(
-                "HEARTBEAT  unit={}".format(msg.get("unit_state","")),
-                "dim")
+                "HEARTBEAT  unit={}".format(msg.get("unit_state", "")), "dim")
             for s in msg.get("sensors", []):
                 self._refresh_sensor_row(s)
 
         elif t == "config_response":
-            self._apply_sensor_list(msg.get("sensors", []))
+            sensors = msg.get("sensors", [])
+            self._apply_sensor_list(sensors)
+            self._log_event(
+                "SENSOR LIST updated — {} sensors".format(len(sensors)), "hub")
 
         elif t == "scheduler_update":
+            self._last_relay_time = time.monotonic()
             self._apply_relay_snapshot(
                 msg.get("relays", {}),
                 msg.get("status", ""))
 
         elif t == "ack":
-            self._log_event(
-                "ACK  {}  {}".format(
-                    msg.get("command","?"),
-                    msg.get("status","?")),
-                "dim")
+            cmd = msg.get("command", "?")
+            st  = msg.get("status", "?")
+            self._log_event("ACK  {}  {}".format(cmd, st), "dim")
+            # Log config saves in event feed
+            if cmd in ("set_unit_config", "set_hub_config", "set_wifi_config"):
+                self._log_event(
+                    "Config saved — Master acknowledged ({})".format(cmd), "info")
 
         elif t == "log_response":
-            self._log_hub(msg.get("line",""))
+            self._log_hub(msg.get("line", ""))
 
     # -----------------------------------------------------------------------
     # STATE UPDATES
@@ -851,10 +852,9 @@ class DebuggerApp:
         pending   = snap.get("pending_status")
         ip        = snap.get("wifi_ip",          "")
         inet_up   = snap.get("internet_up",      False)
-        sensors   = snap.get("sensors",          [])
-        relays    = snap.get("relays",            {})
         sched     = snap.get("scheduler_status", "")
         hub_cfg   = snap.get("sensor_hub_config", {})
+        hub_state = snap.get("hub_state",        "UNKNOWN")
 
         colour = STATUS_COLOURS.get(unit, C_DIM)
         self._lbl_unit_big.config(text=unit, fg=colour)
@@ -862,13 +862,19 @@ class DebuggerApp:
 
         occ_colour = C_GREEN if sensor == "occupied" else C_DIM
         self._lbl_sensor_occ.config(
-            text="Sensor: {}".format(sensor.upper()),
-            fg=occ_colour)
+            text="Sensor: {}".format(sensor.upper()), fg=occ_colour)
         self._lbl_occ.config(
-            text="Sensor: {}".format(sensor.upper()),
-            fg=occ_colour)
+            text="Sensor: {}".format(sensor.upper()), fg=occ_colour)
 
         self._update_internet_indicator(inet_up)
+
+        # Hub label from snapshot — solves "Hub: —" after connect
+        if hub_state == "READY":
+            self._lbl_hub.config(text="Hub: READY", fg=C_GREEN)
+        elif hub_state == "BOOTING":
+            self._lbl_hub.config(text="Hub: BOOTING", fg=C_YELLOW)
+        else:
+            self._lbl_hub.config(text="Hub: UNKNOWN", fg=C_DIM)
 
         if pending:
             txt = "⏳ Pending: {}".format(pending)
@@ -881,35 +887,38 @@ class DebuggerApp:
         self._lbl_ip.config(
             text="IP: {}".format(ip) if ip else "IP: —")
 
-        self._apply_sensor_list(sensors)
-        self._apply_relay_snapshot(relays, sched)
+        if sched:
+            self._apply_relay_snapshot({}, sched)
 
         # Populate config tab entries
         for key, entry in self._cfg_entries.items():
-            val = snap.get(key) or ""
+            if key == "wifi_password":
+                continue   # never populate password field from snapshot
+            val = snap.get(key, "")
+            if val is None:
+                val = ""
             entry.delete(0, tk.END)
             entry.insert(0, str(val))
 
         for key, entry in self._hub_entries.items():
             val = hub_cfg.get(key, "")
+            if val is None:
+                val = ""
             entry.delete(0, tk.END)
             entry.insert(0, str(val))
 
         if "watchdog_enable" in hub_cfg:
             self._wd_enable_var.set(bool(hub_cfg["watchdog_enable"]))
 
-        self._log_event("State snapshot received", "dim")
+        self._log_event("State snapshot received — unit={}".format(unit), "dim")
 
     def _update_internet_indicator(self, is_up):
         if is_up:
-            self._lbl_inet.config(
-                text="Internet: ✓ UP", fg=C_GREEN)
+            self._lbl_inet.config(text="Internet: ✓ UP", fg=C_GREEN)
             self._lbl_inet_mode.config(
-                text="Mode: 4-state (full booking logic)",
-                fg=C_GREEN)
+                text="Mode: 4-state (full booking logic)", fg=C_GREEN)
         else:
-            self._lbl_inet.config(
-                text="Internet: ✗ DOWN", fg=C_RED)
+            self._lbl_inet.config(text="Internet: ✗ DOWN", fg=C_RED)
             self._lbl_inet_mode.config(
                 text="Mode: 2-state fallback (Occupied/Vacant only)",
                 fg=C_YELLOW)
@@ -921,14 +930,19 @@ class DebuggerApp:
         for s in sensors:
             if not isinstance(s, dict):
                 continue
-            idx    = s.get("index",   "?")
-            name   = s.get("name",    "?")
-            model  = s.get("model",   "?")
-            role   = s.get("role",    "?")
+            idx    = s.get("index", "?")
+            name   = s.get("name",  "?")
+            model  = s.get("model", "?")
+            role   = s.get("role",  "?")
             online = "✓" if s.get("online", False) else "✗"
             batt   = "{}%".format(s.get("battery", "?"))
-            state_v = s.get("contact",
-                      s.get("presence_str", "—"))
+            # State column: door sensors show OPEN/CLOSED, presence show YES/NO
+            if role == "DOOR":
+                contact = s.get("contact", "—")
+                state_v = contact if contact else "—"
+            else:
+                pres = s.get("presence", None)
+                state_v = ("YES" if pres else "NO") if pres is not None else "—"
             self._sensor_tree.insert(
                 "", tk.END,
                 iid=str(idx),
@@ -938,12 +952,35 @@ class DebuggerApp:
             self._sensors[name]     = s
 
     def _refresh_sensor_row(self, s):
-        idx = str(s.get("index", s.get("name", "")))
-        if self._sensor_tree.exists(idx):
-            vals = list(self._sensor_tree.item(idx, "values"))
-            vals[4] = "✓" if s.get("online", False) else "✗"
-            vals[6] = "{}%".format(s.get("battery", "?"))
-            self._sensor_tree.item(idx, values=vals)
+        """Update a single sensor row from heartbeat data."""
+        name = s.get("name", "")
+        # Find by name
+        for iid in self._sensor_tree.get_children():
+            vals = list(self._sensor_tree.item(iid, "values"))
+            if vals[1] == name:
+                vals[4] = "✓" if s.get("online", False) else "✗"
+                batt = s.get("battery", None)
+                if batt is not None:
+                    vals[6] = "{}%".format(batt)
+                # contact / presence
+                contact = s.get("contact", None)
+                if contact is not None:
+                    vals[5] = contact
+                else:
+                    pres = s.get("presence", None)
+                    if pres is not None:
+                        vals[5] = "YES" if pres else "NO"
+                self._sensor_tree.item(iid, values=vals)
+                break
+
+    def _update_sensor_state_col(self, name, state_val):
+        """Update the State column for a sensor by name."""
+        for iid in self._sensor_tree.get_children():
+            vals = list(self._sensor_tree.item(iid, "values"))
+            if vals[1] == name:
+                vals[5] = state_val
+                self._sensor_tree.item(iid, values=vals)
+                break
 
     def _update_sensor_env(self, name, temp_c, hum_pct):
         for iid in self._sensor_tree.get_children():
@@ -995,25 +1032,22 @@ class DebuggerApp:
     def _log_event(self, text, tag="info"):
         box = self._event_log
         box.config(state=tk.NORMAL)
-        box.insert(tk.END,
-                   "[{}]  {}\n".format(self._ts(), text), tag)
+        box.insert(tk.END, "[{}]  {}\n".format(self._ts(), text), tag)
         box.see(tk.END)
         box.config(state=tk.DISABLED)
 
     def _log(self, text, tag="info"):
         box = self._log_box
         box.config(state=tk.NORMAL)
-        box.insert(tk.END,
-                   "[{}]  {}\n".format(self._ts(), text), tag)
+        box.insert(tk.END, "[{}]  {}\n".format(self._ts(), text), tag)
         box.see(tk.END)
         box.config(state=tk.DISABLED)
 
     def _log_raw(self, msg):
         t = msg.get("type", "")
-        if t in ("state_snapshot", "pong"):
-            return
-        self._log(
-            "← RX  {}".format(json.dumps(msg)[:120]), "rx")
+        if t in ("state_snapshot", "pong", "scheduler_update"):
+            return   # too noisy — skip these in raw log
+        self._log("← RX  {}".format(json.dumps(msg)[:140]), "rx")
 
     def _log_hub(self, line):
         box = self._log_box
@@ -1063,15 +1097,14 @@ class DebuggerApp:
     def _restart_hub(self):
         if messagebox.askyesno(
             "Restart Hub",
-            "Restart the Sensor Hub?\n"
-            "Sensors will reconnect automatically."
+            "Restart the Sensor Hub?\nSensors will reconnect automatically."
         ):
             self._tcp.send({"type": "hub_restart"})
             self._log("TX → hub_restart", "tx")
 
     def _hub_factory_reset(self):
         if messagebox.askyesno(
-            "Factory Reset",
+            "Factory Reset Sensor Hub",
             "⚠  Factory reset the Sensor Hub?\n\n"
             "Sensor names will be erased.\n"
             "Sensors re-pair automatically — no button press needed.",
@@ -1087,6 +1120,26 @@ class DebuggerApp:
         ):
             self._tcp.send({"type": "master_restart"})
             self._log("TX → master_restart", "tx")
+
+    def _restart_scheduler(self):
+        if messagebox.askyesno(
+            "Restart Scheduler",
+            "Restart the Scheduler ESP32-S3?\n"
+            "Relay schedules will reload from saved config."
+        ):
+            self._tcp.send({"type": "scheduler_restart"})
+            self._log("TX → scheduler_restart", "tx")
+
+    def _scheduler_factory_reset(self):
+        if messagebox.askyesno(
+            "Scheduler Factory Reset",
+            "⚠  Factory reset the Scheduler?\n\n"
+            "This will ERASE all relay schedules and reboot the Scheduler.\n"
+            "Default schedules will be applied on next boot.",
+            icon="warning"
+        ):
+            self._tcp.send({"type": "scheduler_factory_reset"})
+            self._log("TX → scheduler_factory_reset", "tx")
 
     def _save_unit_config(self):
         payload = {"type": "set_unit_config"}
@@ -1109,14 +1162,9 @@ class DebuggerApp:
             "type":            "set_hub_config",
             "watchdog_enable": self._wd_enable_var.get()
         }
-        int_fields = [
-            "pairing_duration_sec",
-            "watchdog_interval_min",
-            "watchdog_ping_timeout_sec",
-            "door_alarm_threshold_min",
-            "heartbeat_interval_min",
-        ]
-        for key in int_fields:
+        for key in ("pairing_duration_sec", "watchdog_interval_min",
+                    "watchdog_ping_timeout_sec", "door_alarm_threshold_min",
+                    "heartbeat_interval_min"):
             entry = self._hub_entries.get(key)
             if entry:
                 try:
@@ -1137,6 +1185,30 @@ class DebuggerApp:
             })
             self._log("TX → set_wifi_config (credentials hidden)", "tx")
 
+    def _remove_sensor(self):
+        sel = self._sensor_tree.selection()
+        if not sel:
+            messagebox.showinfo("Remove Sensor",
+                                "Select a sensor row first.")
+            return
+        iid  = sel[0]
+        vals = self._sensor_tree.item(iid, "values")
+        idx  = vals[0]
+        name = vals[1]
+        if messagebox.askyesno(
+            "Remove Sensor",
+            "Remove sensor:\n\n  [{}] {}\n\n"
+            "The sensor will be removed from the registry.\n"
+            "It can re-pair next time pairing is opened.".format(idx, name)
+        ):
+            self._tcp.send({
+                "type":         "remove_sensor",
+                "sensor_index": int(idx)
+            })
+            self._sensor_tree.delete(iid)
+            self._log(
+                "TX → remove_sensor index={} ({})".format(idx, name), "tx")
+
     def _on_sensor_double_click(self, event):
         sel = self._sensor_tree.selection()
         if not sel:
@@ -1151,17 +1223,19 @@ class DebuggerApp:
             initialvalue=name,
             parent=self.root
         )
-        if (new_name and
-                new_name.strip() and
-                new_name.strip() != name):
+        if new_name and new_name.strip() and new_name.strip() != name:
+            new_name = new_name.strip()
             self._tcp.send({
                 "type":         "set_sensor_name",
                 "sensor_index": int(idx),
-                "name":         new_name.strip()
+                "name":         new_name
             })
+            # Update treeview locally immediately — no round-trip wait
+            new_vals    = list(vals)
+            new_vals[1] = new_name
+            self._sensor_tree.item(iid, values=new_vals)
             self._log(
-                "TX → set_sensor_name {} → '{}'".format(
-                    idx, new_name.strip()), "tx")
+                "TX → set_sensor_name {} → '{}'".format(idx, new_name), "tx")
 
 
 # ============================================================================
@@ -1172,13 +1246,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Innovatsii EMS Pico 1 Desktop Debugger")
     parser.add_argument(
-        "--ip",
-        default=DEFAULT_IP,
+        "--ip", default=DEFAULT_IP,
         help="Master IP address (default: {})".format(DEFAULT_IP))
     parser.add_argument(
-        "--port",
-        type=int,
-        default=DEFAULT_PORT,
+        "--port", type=int, default=DEFAULT_PORT,
         help="TCP port (default: {})".format(DEFAULT_PORT))
     args = parser.parse_args()
 
