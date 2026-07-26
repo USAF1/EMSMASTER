@@ -1,26 +1,15 @@
 # main.py — MASTER (ESP32-S3)
 # Innovatsii EMS — Pico 1
 #
-# UART1 <-> Sensor Hub  (TX=GPIO16, RX=GPIO17)
-# UART2 <-> Scheduler   (TX=GPIO18, RX=GPIO21) — Scheduler UART disabled until Phase 4
+# UART1 <-> Sensor Hub  (TX=GPIO16, RX=GPIO17) at 9600 baud
+# UART2 <-> Scheduler   — NOT INITIALISED (Phase 4)
 # TCP   <-> Debugger App (port 8765)
 #
-# Boot sequence (Section 9 of architecture doc):
-#   Master boots → starts UART RX listener → waits for hub_boot from Hub
-#   hub_boot arrives (before Zigbee radio starts) → send set_config immediately
-#   ACK received → send get_config → Hub responds with config_response
-#   WiFi + NTP run in parallel background thread
-#
-# Production rules applied:
-#   - Pre-allocated fixed bytearray RX buffers (no unbounded growth)
-#   - All JSON built as dict then serialised once
-#   - All exception paths explicitly handled and logged
-#   - Tick arithmetic uses ticks_diff for rollover safety
-#   - Config written atomically (write + rename pattern)
-#   - Every shared state access is lock-protected
-#   - UART TX serialised through helpers — never interleaved
-#   - TCP TX serialised through helper — never interleaved
-#   - NTP sync after WiFi — real UTC epoch for booking window
+# Fixes in this version:
+#   - _hub_config_push_in_progress guard prevents duplicate config push threads
+#   - try/finally in _hub_push_config_and_wait ensures flag always resets
+#   - Scheduler UART fully disabled — no Pin objects on GPIO18/21
+#   - Raw hex debug logging on TX and RX for diagnosis
 
 import utime
 import ujson as json
@@ -34,16 +23,16 @@ import master_config as cfg
 # CONSTANTS
 # ============================================================================
 
-UART_RX_BUF_MAX       = 512
-MAIN_LOOP_TICK_MS     = 1000
-TCP_PORT              = 8765
-TCP_RX_BUF_MAX        = 1024
-INTERNET_CHECK_HOST   = "8.8.8.8"
-INTERNET_CHECK_PORT   = 53
-INTERNET_CHECK_TIMEOUT_S  = 3
-INTERNET_RECHECK_S    = 60
-NTP_SYNC_INTERVAL_S   = 3600       # re-sync NTP every hour
-HUB_CONFIG_ACK_TIMEOUT_MS = 3000  # how long to wait for set_config ACK
+UART_RX_BUF_MAX            = 512
+MAIN_LOOP_TICK_MS          = 1000
+TCP_PORT                   = 8765
+TCP_RX_BUF_MAX             = 1024
+INTERNET_CHECK_HOST        = "8.8.8.8"
+INTERNET_CHECK_PORT        = 53
+INTERNET_CHECK_TIMEOUT_S   = 3
+INTERNET_RECHECK_S         = 60
+NTP_SYNC_INTERVAL_S        = 3600
+HUB_CONFIG_ACK_TIMEOUT_MS  = 5000
 
 # ============================================================================
 # UART INITIALISATION
@@ -54,11 +43,8 @@ uart_sensor = UART(cfg.SENSOR_UART_ID,
                    tx=cfg.SENSOR_UART_TX,
                    rx=cfg.SENSOR_UART_RX)
 
-# Scheduler UART — initialised but sends disabled until Phase 4
-uart_sched  = UART(cfg.SCHED_UART_ID,
-                   baudrate=cfg.SCHED_UART_BAUD,
-                   tx=cfg.SCHED_UART_TX,
-                   rx=cfg.SCHED_UART_RX)
+# Scheduler UART — completely disabled until Phase 4
+uart_sched = None
 
 _rx_sensor_buf = bytearray(UART_RX_BUF_MAX)
 _rx_sched_buf  = bytearray(UART_RX_BUF_MAX)
@@ -86,17 +72,15 @@ state = {
     "pending_apply_epoch":    0,
 }
 
-# Internet / hub / NTP tracking — not persisted
 _internet_up     = False
 _wifi_ip         = ""
-_hub_state       = "UNKNOWN"   # "UNKNOWN" | "BOOTING" | "READY"
+_hub_state       = "UNKNOWN"
 _tcp_client      = None
 _mac_str         = ""
-_ntp_synced      = False       # True once NTP has set the RTC
-_last_ntp_sync   = 0           # ticks_ms of last successful NTP sync
-
-# Hub config ACK tracking
-_hub_config_ack_pending = False
+_ntp_synced      = False
+_last_ntp_sync   = 0
+_hub_config_ack_pending      = False
+_hub_config_push_in_progress = False   # guards against duplicate push threads
 
 # ============================================================================
 # PERSISTENT CONFIG
@@ -115,7 +99,6 @@ def load_config():
     except Exception as e:
         print("CONFIG load failed, using defaults:", e)
         conf = {}
-
     changed = False
     def _merge(target, source):
         nonlocal changed
@@ -148,8 +131,12 @@ def save_config():
 def _uart_send(uart_obj, lock_obj, payload_dict):
     try:
         msg = json.dumps(payload_dict) + "\n"
+        print("MASTER TX RAW :", msg.rstrip())
+        raw_bytes = msg.encode("utf-8")
+        hex_str = " ".join("{:02x}".format(b) for b in raw_bytes)
+        print("MASTER TX HEX :", hex_str)
         with lock_obj:
-            uart_obj.write(msg.encode("utf-8"))
+            uart_obj.write(raw_bytes)
     except Exception as e:
         print("UART TX error:", repr(e))
 
@@ -159,7 +146,6 @@ def send_to_sensor_hub(payload_dict):
 
 
 def send_to_scheduler(payload_dict):
-    # Phase 4 — Scheduler UART sends disabled for now
     print("SCHED TX (disabled): {}".format(payload_dict.get("type", "?")))
 
 
@@ -168,7 +154,6 @@ def send_to_scheduler(payload_dict):
 # ============================================================================
 
 def tcp_forward(msg_dict):
-    """Send a message to the connected TCP debugger client. Non-blocking."""
     global _tcp_client
     if _tcp_client is None:
         return
@@ -186,7 +171,6 @@ def tcp_forward(msg_dict):
 # ============================================================================
 
 def _sync_ntp():
-    """Try NTP sync. Returns True on success."""
     global _ntp_synced, _last_ntp_sync
     try:
         import ntptime
@@ -220,7 +204,6 @@ def parse_utc_to_epoch(dt_str):
 
 
 def now_epoch_utc():
-    """Return current UTC epoch. Real time after NTP sync."""
     return utime.time()
 
 
@@ -233,33 +216,26 @@ def in_booking_window(now_ep, checkin_ep, checkout_ep):
 # ============================================================================
 
 def decide_status(sensor_status, now_ep):
-    """
-    2-state fallback until internet confirmed AND NTP synced.
-    4-state full logic when both conditions are met.
-    """
     if not _internet_up or not _ntp_synced:
         result = "Occupied" if sensor_status == "occupied" else "Vacant"
         reason = "no internet" if not _internet_up else "NTP not synced"
         print("DECIDE [2-state — {}]: sensor={} => {}".format(
               reason, sensor_status, result))
         return result
-
     checkin_ep  = parse_utc_to_epoch(conf.get("check_in_utc",  "2000-01-01 00:00:00"))
     checkout_ep = parse_utc_to_epoch(conf.get("check_out_utc", "2000-01-01 00:00:00"))
     inside      = in_booking_window(now_ep, checkin_ep, checkout_ep)
-
     if sensor_status == "occupied":
         result = "Occupied" if inside else "UnSold Occupied"
     else:
         result = "Sold Vacant" if inside else "Vacant"
-
     print("DECIDE [4-state]: sensor={} inside={} now={} => {}".format(
           sensor_status, inside, now_ep, result))
     return result
 
 
 # ============================================================================
-# SCHEDULER COMMANDS  (Phase 4 — disabled for now)
+# SCHEDULER COMMANDS — Phase 4 disabled
 # ============================================================================
 
 def send_status_to_scheduler(status):
@@ -297,7 +273,6 @@ def recalc_and_act():
     now_ep = now_epoch_utc()
     sensor = state["last_sensor_status"]
     target = decide_status(sensor, now_ep)
-
     if target in ("Sold Vacant", "Vacant"):
         schedule_buffered(target, now_ep)
     else:
@@ -338,15 +313,10 @@ def build_state_snapshot():
 
 
 # ============================================================================
-# HUB CONFIG SEND — called when hub_boot arrives (radio not yet started)
+# HUB CONFIG SEND
 # ============================================================================
 
 def hub_cmd_push_config():
-    """
-    Send set_config to Hub.
-    Sets _hub_config_ack_pending = True.
-    ACK clears it in _handle_ack().
-    """
     global _hub_config_ack_pending
     hub_cfg = conf.get("sensor_hub_config", {})
     payload = {
@@ -365,35 +335,74 @@ def hub_cmd_push_config():
 
 def _hub_push_config_and_wait():
     """
-    Called from hub_boot handler in a new thread.
-    Sends set_config and waits for ACK.
-    Since hub_boot arrives BEFORE Zigbee radio starts,
-    this transmission has no radio interference — ACK should always arrive.
-    If ACK does not arrive within timeout, log a warning and continue.
-    After ACK (or timeout), send get_config to get sensor list.
+    Sends set_config to Hub and waits for ACK.
+    Uses try/finally to guarantee _hub_config_push_in_progress is always
+    cleared — even if an exception occurs inside the thread.
+    MicroPython _thread does not run finally on normal exit so we
+    explicitly clear at the end of both paths.
     """
-    global _hub_config_ack_pending
-
-    # Small delay to let hub_boot handler finish before we start TX
-    utime.sleep_ms(50)
-
-    hub_cmd_push_config()
-
-    # Wait for ACK — Hub should respond within ~100ms since radio is idle
-    deadline = utime.ticks_add(utime.ticks_ms(), HUB_CONFIG_ACK_TIMEOUT_MS)
-    while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
-        if not _hub_config_ack_pending:
-            print("HUB CONFIG: ACK received — config confirmed applied")
-            break
+    global _hub_config_ack_pending, _hub_config_push_in_progress
+    try:
         utime.sleep_ms(50)
-    else:
-        print("HUB CONFIG: WARNING — no ACK within {}ms".format(
-              HUB_CONFIG_ACK_TIMEOUT_MS))
-        print("HUB CONFIG: Hub will use NVS defaults or last saved config")
+        hub_cmd_push_config()
 
-    # Always send get_config regardless of ACK — get current sensor list
-    utime.sleep_ms(100)
-    hub_cmd_get_config()
+        deadline = utime.ticks_add(utime.ticks_ms(), HUB_CONFIG_ACK_TIMEOUT_MS)
+        while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
+            if not _hub_config_ack_pending:
+                print("HUB CONFIG: ACK received — config confirmed applied")
+                break
+            utime.sleep_ms(50)
+        else:
+            print("HUB CONFIG: WARNING — no ACK within {}ms".format(
+                  HUB_CONFIG_ACK_TIMEOUT_MS))
+
+        utime.sleep_ms(100)
+        hub_cmd_get_config()
+
+    except Exception as e:
+        print("HUB CONFIG: thread error:", repr(e))
+    finally:
+        _hub_config_push_in_progress = False
+        print("HUB CONFIG: push thread complete — lock released")
+
+
+# ============================================================================
+# DATA FILTERING
+# ============================================================================
+
+_last_temp    = {}
+_last_hum     = {}
+_last_battery = {}
+
+ENV_TEMP_THRESHOLD_C   = 0.5
+ENV_HUM_THRESHOLD_PCT  = 1.0
+BATTERY_THRESHOLD_PCT  = 2
+
+
+def _should_forward_environment(sensor, temp_c, hum_pct):
+    last_t = _last_temp.get(sensor)
+    last_h = _last_hum.get(sensor)
+    if last_t is None or last_h is None:
+        _last_temp[sensor] = temp_c
+        _last_hum[sensor]  = hum_pct
+        return True
+    if abs(temp_c - last_t) >= ENV_TEMP_THRESHOLD_C or \
+       abs(hum_pct - last_h) >= ENV_HUM_THRESHOLD_PCT:
+        _last_temp[sensor] = temp_c
+        _last_hum[sensor]  = hum_pct
+        return True
+    return False
+
+
+def _should_forward_battery(sensor, pct):
+    last = _last_battery.get(sensor)
+    if last is None:
+        _last_battery[sensor] = pct
+        return True
+    if abs(pct - last) >= BATTERY_THRESHOLD_PCT:
+        _last_battery[sensor] = pct
+        return True
+    return False
 
 
 # ============================================================================
@@ -403,7 +412,7 @@ def _hub_push_config_and_wait():
 def _handle_unit_occupancy(msg):
     raw = msg.get("state", "")
     if not isinstance(raw, str):
-        print("WARN unit_occupancy: state field missing")
+        print("WARN unit_occupancy: state field invalid")
         return
     s = raw.strip().upper()
     sensor_status = "occupied" if s == "OCCUPIED" else "vacant"
@@ -418,56 +427,97 @@ def _handle_unit_occupancy(msg):
 
 
 def _handle_sensor_presence(msg):
+    sensor    = msg.get("sensor", "?")
+    state_val = msg.get("state", "?")
+    if not isinstance(sensor, str) or not isinstance(state_val, str):
+        print("WARN sensor_presence: invalid fields")
+        return
     print("PRESENCE: sensor={} state={} ts={}".format(
-          msg.get("sensor", "?"), msg.get("state", "?"), msg.get("ts_utc", "?")))
+          sensor, state_val, msg.get("ts_utc", "?")))
     tcp_forward(msg)
 
 
 def _handle_environment(msg):
     temp_x100 = msg.get("temp_c_x100", 0)
+    hum_x100  = msg.get("hum_pct_x100", 0)
     if not isinstance(temp_x100, (int, float)):
-        print("WARN environment: invalid temp field")
+        print("WARN environment: invalid temp_c_x100")
         return
-    print("ENVIRONMENT: sensor={} temp={:.2f}C hum={:.2f}% ts={}".format(
-          msg.get("sensor", "?"), temp_x100 / 100.0,
-          msg.get("hum_pct_x100", 0) / 100.0, msg.get("ts_utc", "?")))
-    tcp_forward(msg)
+    if not isinstance(hum_x100, (int, float)):
+        print("WARN environment: invalid hum_pct_x100")
+        return
+    sensor  = msg.get("sensor", "?")
+    temp_c  = temp_x100 / 100.0
+    hum_pct = hum_x100  / 100.0
+    if _should_forward_environment(sensor, temp_c, hum_pct):
+        print("ENVIRONMENT: sensor={} temp={:.2f}C hum={:.2f}% ts={}".format(
+              sensor, temp_c, hum_pct, msg.get("ts_utc", "?")))
+        tcp_forward(msg)
+    else:
+        print("ENVIRONMENT: sensor={} temp={:.2f}C hum={:.2f}% — suppressed".format(
+              sensor, temp_c, hum_pct))
 
 
 def _handle_door(msg):
+    sensor    = msg.get("sensor", "?")
+    state_val = msg.get("state", "?")
+    if not isinstance(sensor, str) or not isinstance(state_val, str):
+        print("WARN door: invalid fields")
+        return
     print("DOOR: sensor={} state={} ts={}".format(
-          msg.get("sensor", "?"), msg.get("state", "?"), msg.get("ts_utc", "?")))
+          sensor, state_val, msg.get("ts_utc", "?")))
     tcp_forward(msg)
 
 
 def _handle_door_alarm(msg):
+    duration = msg.get("duration_sec", 0)
+    if not isinstance(duration, (int, float)):
+        duration = 0
     print("DOOR ALARM: sensor={} state={} duration={}s ts={}".format(
           msg.get("sensor", "?"), msg.get("state", "?"),
-          msg.get("duration_sec", 0), msg.get("ts_utc", "?")))
+          int(duration), msg.get("ts_utc", "?")))
     tcp_forward(msg)
 
 
 def _handle_sensor_health(msg):
+    sensor    = msg.get("sensor", "?")
+    state_val = msg.get("state", "?")
+    if not isinstance(sensor, str) or not isinstance(state_val, str):
+        print("WARN sensor_health: invalid fields")
+        return
     print("SENSOR HEALTH: sensor={} state={} ts={}".format(
-          msg.get("sensor", "?"), msg.get("state", "?"), msg.get("ts_utc", "?")))
+          sensor, state_val, msg.get("ts_utc", "?")))
     tcp_forward(msg)
 
 
 def _handle_battery(msg):
-    print("BATTERY: sensor={} pct={}% ts={}".format(
-          msg.get("sensor", "?"), msg.get("battery_pct", 0), msg.get("ts_utc", "?")))
-    tcp_forward(msg)
+    sensor = msg.get("sensor", "?")
+    pct    = msg.get("battery_pct", 0)
+    if not isinstance(pct, (int, float)):
+        print("WARN battery: invalid battery_pct")
+        return
+    pct = int(pct)
+    if _should_forward_battery(sensor, pct):
+        print("BATTERY: sensor={} pct={}% ts={}".format(
+              sensor, pct, msg.get("ts_utc", "?")))
+        tcp_forward(msg)
+    else:
+        print("BATTERY: sensor={} pct={}% — suppressed".format(sensor, pct))
 
 
 def _handle_heartbeat(msg):
-    print("HEARTBEAT: unit={} ts={}".format(
-          msg.get("unit_state", "?"), msg.get("ts_utc", "?")))
+    unit = msg.get("unit_state", "?")
+    if not isinstance(unit, str):
+        print("WARN heartbeat: invalid unit_state")
+        return
+    print("HEARTBEAT: unit={} ts={}".format(unit, msg.get("ts_utc", "?")))
     tcp_forward(msg)
 
 
 def _handle_config_response(msg):
     sensors = msg.get("sensors", [])
     if not isinstance(sensors, list):
+        print("WARN config_response: sensors not a list")
         return
     hub_cfg = conf.get("sensor_hub_config", {})
     names   = hub_cfg.get("sensor_names", {})
@@ -476,7 +526,7 @@ def _handle_config_response(msg):
             continue
         idx  = s.get("index")
         name = s.get("name")
-        if idx is not None and name:
+        if idx is not None and name and isinstance(name, str):
             names[str(idx)] = name
     conf["sensor_hub_config"]["sensor_names"] = names
     save_config()
@@ -488,6 +538,9 @@ def _handle_ack(msg):
     global _hub_config_ack_pending
     cmd    = msg.get("command", "?")
     status = msg.get("status", "?")
+    if not isinstance(cmd, str):
+        print("WARN ack: invalid command field")
+        return
     print("ACK: command={} status={} ts={}".format(
           cmd, status, msg.get("ts_utc", "?")))
     if cmd == "set_config" and status == "ok":
@@ -497,48 +550,53 @@ def _handle_ack(msg):
 
 
 def _handle_log_response(msg):
-    print("SENSORHUB LOG:", msg.get("line", ""))
+    line = msg.get("line", "")
+    if not isinstance(line, str):
+        line = str(line)
+    print("SENSORHUB LOG:", line)
     tcp_forward(msg)
 
 
 def _handle_hub_boot(msg):
     """
-    Hub sends this immediately on app_main BEFORE Zigbee stack starts.
-    This is the correct window to send set_config — zero radio interference.
-    Architecture doc Section 9 step 7:
-      'Receive hub_boot from Sensor Hub — re-push config and get_config'
+    Called every time a hub_boot message arrives.
+    Guard prevents spawning duplicate config-push threads if hub_boot
+    arrives again before the first push thread has completed.
+    If the Hub reboots while Master is running, the guard will have
+    been cleared by the previous thread's finally block, so a new
+    thread is spawned correctly.
     """
-    global _hub_state
+    global _hub_state, _hub_config_push_in_progress
     _hub_state = "BOOTING"
     count = msg.get("sensor_count", 0)
+    if not isinstance(count, int):
+        count = 0
     print("HUB BOOT: sensor_count={} unit_state={} ts={}".format(
           count, msg.get("unit_state", "?"), msg.get("ts_utc", "?")))
-    print("HUB BOOT: Hub UART ready, Zigbee not yet started — sending config now")
-    # Run in background thread so sensor_rx_loop is not blocked
+
+    if _hub_config_push_in_progress:
+        print("HUB BOOT: config push already in progress — skipping duplicate")
+        tcp_forward(msg)
+        return
+
+    print("HUB BOOT: sending config now")
+    _hub_config_push_in_progress = True
     _thread.start_new_thread(_hub_push_config_and_wait, ())
     tcp_forward(msg)
 
 
 def _handle_hub_ready(msg):
-    """
-    Hub sends this when pairing window closes.
-    Sensors that were already paired should have auto-rejoined during the
-    pairing window. If all are still offline, open a short 30s window.
-    """
     global _hub_state
     _hub_state = "READY"
     online  = msg.get("online_count", 0)
     offline = msg.get("offline_count", 0)
+    if not isinstance(online,  int): online  = 0
+    if not isinstance(offline, int): offline = 0
     print("HUB READY: online={} offline={} unit={} ts={}".format(
           online, offline, msg.get("unit_state", "?"), msg.get("ts_utc", "?")))
     tcp_forward(msg)
-
-    # If all sensors are offline after pairing window, open a short
-    # re-pairing window. Sensors that have Zigbee keys will rejoin
-    # automatically — no button press needed (architecture doc Section 12.3).
     if offline > 0 and online == 0:
-        print("HUB READY: all {} sensors offline — opening 30s re-pair window".format(
-              offline))
+        print("HUB READY: all sensors offline — opening 30s re-pair window")
         utime.sleep_ms(300)
         hub_cmd_start_pairing(30)
 
@@ -562,8 +620,8 @@ _SENSOR_MSG_HANDLERS = {
 
 def handle_sensor_msg(msg):
     msg_type = msg.get("type")
-    if not msg_type:
-        print("WARN: sensor msg missing 'type' field")
+    if not msg_type or not isinstance(msg_type, str):
+        print("WARN: sensor msg missing or invalid 'type'")
         return
     handler = _SENSOR_MSG_HANDLERS.get(msg_type)
     if handler:
@@ -583,6 +641,9 @@ def handle_scheduler_msg(msg):
     msg_type = msg.get("type")
     if msg_type == "scheduler_update":
         st = msg.get("status")
+        if not isinstance(st, str):
+            print("WARN scheduler_update: invalid status")
+            return
         with _state_lock:
             state["last_scheduler_status"] = st
             conf["last_scheduler_status"]  = st
@@ -757,8 +818,11 @@ def handle_tcp_command(msg):
             hub_cfg["watchdog_enable"] = bool(msg["watchdog_enable"])
         conf["sensor_hub_config"] = hub_cfg
         save_config()
-        # Push config in background thread — same timing-safe path as boot
-        _thread.start_new_thread(_hub_push_config_and_wait, ())
+        # Re-use the same guarded push path
+        global _hub_config_push_in_progress
+        if not _hub_config_push_in_progress:
+            _hub_config_push_in_progress = True
+            _thread.start_new_thread(_hub_push_config_and_wait, ())
         _tcp_send_ack("set_hub_config")
         print("HUB CONFIG updated and pushing to Hub")
         tcp_forward(build_state_snapshot())
@@ -808,17 +872,21 @@ def handle_tcp_command(msg):
 # ============================================================================
 
 def _process_uart_line(line_bytes, handler_fn):
+    raw = bytes(line_bytes)
+    hex_str = " ".join("{:02x}".format(b) for b in raw)
+    print("MASTER RX HEX :", hex_str)
     try:
-        s = line_bytes.decode("utf-8").strip()
+        s = raw.decode("utf-8").strip()
+        print("MASTER RX ASCII:", s)
     except Exception:
-        print("WARN: UART line UTF-8 decode failed")
+        print("MASTER RX ASCII: <UTF-8 decode failed>")
         return False
     if not s:
         return False
     try:
         msg = json.loads(s)
     except Exception:
-        print("WARN: UART bad JSON:", s[:60])
+        print("WARN: UART bad JSON:", s[:80])
         return False
     if not isinstance(msg, dict):
         print("WARN: UART JSON is not a dict")
@@ -834,12 +902,19 @@ def sensor_rx_loop():
             if uart_sensor.any():
                 data = uart_sensor.read()
                 if data:
+                    hex_str = " ".join("{:02x}".format(b) for b in data)
+                    print("MASTER RX RAW [{} bytes]: {}".format(
+                          len(data), hex_str))
+
                     for b in data:
                         ch = b if isinstance(b, int) else ord(b)
 
-                        if ch < 0x20 and ch != 0x09 and ch != 0x0A and ch != 0x0D:
+                        if ch < 0x20 and ch != 0x09 \
+                                     and ch != 0x0A \
+                                     and ch != 0x0D:
                             if _rx_sensor_pos > 0:
-                                print("WARN: sensor RX noise 0x{:02x} — buf reset".format(ch))
+                                print("WARN: sensor RX noise 0x{:02x} "
+                                      "— buf reset".format(ch))
                                 _rx_sensor_pos = 0
                             continue
 
@@ -849,17 +924,19 @@ def sensor_rx_loop():
                         if ch == ord('\n'):
                             if _rx_sensor_pos > 0:
                                 if _rx_sensor_buf[0] != ord('{'):
-                                    print("WARN: sensor RX non-JSON (starts 0x{:02x})".format(
+                                    print("WARN: sensor RX non-JSON "
+                                          "(starts 0x{:02x})".format(
                                           _rx_sensor_buf[0]))
                                     _rx_sensor_pos = 0
                                 else:
                                     _process_uart_line(
-                                        memoryview(_rx_sensor_buf)[:_rx_sensor_pos],
+                                        memoryview(_rx_sensor_buf)
+                                        [:_rx_sensor_pos],
                                         handle_sensor_msg)
                                     _rx_sensor_pos = 0
                         else:
                             if _rx_sensor_pos >= UART_RX_BUF_MAX - 1:
-                                print("WARN: sensor RX buf overflow — discarding")
+                                print("WARN: sensor RX buf overflow")
                                 _rx_sensor_pos = 0
                             else:
                                 _rx_sensor_buf[_rx_sensor_pos] = ch
@@ -872,47 +949,9 @@ def sensor_rx_loop():
 
 
 def sched_rx_loop():
-    global _rx_sched_pos
+    """Scheduler UART not initialised until Phase 4 — this loop does nothing."""
     while True:
-        try:
-            if uart_sched.any():
-                data = uart_sched.read()
-                if data:
-                    for b in data:
-                        ch = b if isinstance(b, int) else ord(b)
-
-                        if ch < 0x20 and ch != 0x09 and ch != 0x0A and ch != 0x0D:
-                            if _rx_sched_pos > 0:
-                                print("WARN: sched RX noise 0x{:02x} — buf reset".format(ch))
-                                _rx_sched_pos = 0
-                            continue
-
-                        if ch == ord('\r'):
-                            continue
-
-                        if ch == ord('\n'):
-                            if _rx_sched_pos > 0:
-                                if _rx_sched_buf[0] != ord('{'):
-                                    print("WARN: sched RX non-JSON (starts 0x{:02x})".format(
-                                          _rx_sched_buf[0]))
-                                    _rx_sched_pos = 0
-                                else:
-                                    _process_uart_line(
-                                        memoryview(_rx_sched_buf)[:_rx_sched_pos],
-                                        handle_scheduler_msg)
-                                    _rx_sched_pos = 0
-                        else:
-                            if _rx_sched_pos >= UART_RX_BUF_MAX - 1:
-                                print("WARN: sched RX buf overflow — discarding")
-                                _rx_sched_pos = 0
-                            else:
-                                _rx_sched_buf[_rx_sched_pos] = ch
-                                _rx_sched_pos += 1
-            utime.sleep_ms(30)
-        except Exception as e:
-            print("sched_rx_loop error:", repr(e))
-            _rx_sched_pos = 0
-            utime.sleep_ms(200)
+        utime.sleep_ms(500)
 
 
 # ============================================================================
@@ -928,7 +967,8 @@ def pending_worker():
                 if p is not None:
                     now_ep = now_epoch_utc()
                     if now_ep >= t:
-                        latest = decide_status(state["last_sensor_status"], now_ep)
+                        latest = decide_status(
+                            state["last_sensor_status"], now_ep)
                         print("PENDING due: pending={} latest={} now={}".format(
                               p, latest, now_ep))
                         if latest == p:
@@ -937,7 +977,8 @@ def pending_worker():
                             print("PENDING cancelled — conditions changed")
                         state["pending_status"]      = None
                         state["pending_apply_epoch"] = 0
-                        tcp_forward({"type": "pending_update", "pending_status": None})
+                        tcp_forward({"type": "pending_update",
+                                     "pending_status": None})
             utime.sleep(1)
         except Exception as e:
             print("pending_worker error:", repr(e))
@@ -955,10 +996,8 @@ def tcp_server_thread():
     srv.bind(socket.getaddrinfo("0.0.0.0", TCP_PORT)[0][-1])
     srv.listen(1)
     print("DEBUG: TCP server listening on port {}".format(TCP_PORT))
-
     _rx_tcp_buf = bytearray(TCP_RX_BUF_MAX)
     rx_pos      = 0
-
     while True:
         try:
             conn, addr = srv.accept()
@@ -972,7 +1011,6 @@ def tcp_server_thread():
             print("DEBUG: client connected from {}".format(addr))
             tcp_forward(build_state_snapshot())
             rx_pos = 0
-
             while True:
                 try:
                     data = conn.recv(256)
@@ -987,7 +1025,8 @@ def tcp_server_thread():
                     if ch == ord('\n'):
                         if rx_pos > 0:
                             try:
-                                s   = bytes(_rx_tcp_buf[:rx_pos]).decode("utf-8").strip()
+                                s   = bytes(_rx_tcp_buf[:rx_pos]).decode(
+                                          "utf-8").strip()
                                 msg = json.loads(s)
                                 if isinstance(msg, dict):
                                     handle_tcp_command(msg)
@@ -996,11 +1035,10 @@ def tcp_server_thread():
                             rx_pos = 0
                     else:
                         if rx_pos >= TCP_RX_BUF_MAX - 1:
-                            print("WARN: TCP RX overflow — discarding")
+                            print("WARN: TCP RX overflow")
                             rx_pos = 0
                         _rx_tcp_buf[rx_pos] = ch
                         rx_pos += 1
-
         except Exception as e:
             print("TCP server error:", repr(e))
             utime.sleep_ms(500)
@@ -1045,10 +1083,8 @@ def _set_internet_up(new_state):
 
 def wifi_and_internet_thread():
     global _wifi_ip, _ntp_synced, _last_ntp_sync
-
     ssid = conf.get("wifi_ssid", "")
     pwd  = conf.get("wifi_password", "")
-
     if not ssid:
         print("WIFI: no credentials — 2-state fallback")
         with _state_lock:
@@ -1060,7 +1096,6 @@ def wifi_and_internet_thread():
     wlan.active(True)
     print("WIFI: connecting to '{}'...".format(ssid))
     wlan.connect(ssid, pwd)
-
     deadline = utime.ticks_add(utime.ticks_ms(), 30000)
     while not wlan.isconnected():
         if utime.ticks_diff(deadline, utime.ticks_ms()) <= 0:
@@ -1099,14 +1134,14 @@ def wifi_and_internet_thread():
         print("  DNS     :", cfg_info[3])
         _thread.start_new_thread(tcp_server_thread, ())
 
-    # Internet check
     retries = 3
     internet_found = False
     for attempt in range(retries):
         if _check_internet():
             internet_found = True
             break
-        print("INTERNET: check attempt {}/{} failed".format(attempt + 1, retries))
+        print("INTERNET: check attempt {}/{} failed".format(
+              attempt + 1, retries))
         utime.sleep(2)
 
     if internet_found:
@@ -1114,7 +1149,8 @@ def wifi_and_internet_thread():
         for ntp_attempt in range(3):
             if _sync_ntp():
                 break
-            print("NTP: attempt {}/3 failed — retrying in 5s".format(ntp_attempt + 1))
+            print("NTP: attempt {}/3 failed — retrying in 5s".format(
+                  ntp_attempt + 1))
             utime.sleep(5)
         _set_internet_up(True)
     else:
@@ -1123,7 +1159,6 @@ def wifi_and_internet_thread():
         with _state_lock:
             recalc_and_act()
 
-    # Periodic re-check + NTP re-sync
     while True:
         utime.sleep(INTERNET_RECHECK_S)
         if not wlan.isconnected():
@@ -1143,7 +1178,8 @@ def wifi_and_internet_thread():
 
 load_config()
 
-state["last_sensor_status"]     = str(conf.get("last_sensor_status", "vacant")).lower()
+state["last_sensor_status"]     = str(
+    conf.get("last_sensor_status", "vacant")).lower()
 state["last_scheduler_status"]  = conf.get("last_scheduler_status", None)
 state["current_decided_status"] = None
 
@@ -1151,31 +1187,30 @@ try:
     import ubinascii
     wlan_tmp = network.WLAN(network.STA_IF)
     wlan_tmp.active(True)
-    _mac_str = ubinascii.hexlify(wlan_tmp.config("mac"), ":").decode().upper()
+    _mac_str = ubinascii.hexlify(
+        wlan_tmp.config("mac"), ":").decode().upper()
 except Exception:
     _mac_str = "unknown"
 
 print("=" * 50)
 print("MASTER started")
-print("MASTER MAC  :", _mac_str)
-print("check_in_utc:", conf.get("check_in_utc"))
+print("MASTER MAC   :", _mac_str)
+print("UART1 Hub    : TX=GPIO{}  RX=GPIO{}  BAUD={}".format(
+      cfg.SENSOR_UART_TX, cfg.SENSOR_UART_RX, cfg.SENSOR_UART_BAUD))
+print("UART2 Sched  : DISABLED (Phase 4)")
+print("check_in_utc :", conf.get("check_in_utc"))
 print("check_out_utc:", conf.get("check_out_utc"))
-print("buffer_min  :", conf.get("buffer_minutes"))
-print("tenant_id   :", conf.get("tenant_id"))
-print("unit_id     :", conf.get("unit_id"))
-print("Boot mode   : waiting for hub_boot from Sensor Hub...")
-print("Internet    : waiting for connectivity + NTP sync...")
+print("buffer_min   :", conf.get("buffer_minutes"))
+print("tenant_id    :", conf.get("tenant_id"))
+print("unit_id      :", conf.get("unit_id"))
+print("Boot mode    : waiting for hub_boot from Sensor Hub...")
+print("Internet     : waiting for connectivity + NTP sync...")
 print("=" * 50)
 
-# Apply last persisted status — do NOT recalc until NTP confirmed
 _boot_status = conf.get("last_decided_status", "Vacant")
 state["current_decided_status"] = _boot_status
-print("BOOT: last known status = {} (held until hub_boot + NTP confirmed)".format(
-      _boot_status))
+print("BOOT: last known status = {}".format(_boot_status))
 
-# Start background threads
-# NOTE: Do NOT send set_config here. Wait for hub_boot to arrive.
-# hub_boot arrives BEFORE Zigbee radio starts — that is the safe TX window.
 _thread.start_new_thread(sensor_rx_loop, ())
 _thread.start_new_thread(sched_rx_loop, ())
 _thread.start_new_thread(pending_worker, ())

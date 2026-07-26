@@ -3,21 +3,22 @@
 # Innovatsii EMS — Pico 1
 #
 # UART1 (Master <-> Sensor Hub):  TX=GPIO16  RX=GPIO17
-# UART2 (Master <-> Scheduler):   TX=GPIO18  RX=GPIO21
+# UART2 (Master <-> Scheduler):   NOT INITIALISED — Phase 4
 
 # ============================================================================
 # UART PIN DEFINITIONS
 # ============================================================================
 
-SENSOR_UART_ID = 1
-SENSOR_UART_TX = 4
-SENSOR_UART_RX = 5
-SENSOR_UART_BAUD = 115200
+SENSOR_UART_ID   = 1
+SENSOR_UART_TX   = 16     # GPIO16 → Sensor Hub RX (GPIO5)
+SENSOR_UART_RX   = 17     # GPIO17 ← Sensor Hub TX (GPIO4)
+SENSOR_UART_BAUD = 9600   # Reduced from 115200 for EMI noise immunity
 
-SCHED_UART_ID = 2
-SCHED_UART_TX = 18
-SCHED_UART_RX = 21
-SCHED_UART_BAUD = 115200
+# Scheduler UART pins defined but UART not initialised until Phase 4
+SCHED_UART_ID   = 2
+SCHED_UART_TX   = 18
+SCHED_UART_RX   = 21
+SCHED_UART_BAUD = 9600
 
 # ============================================================================
 # FILE PATHS
@@ -30,38 +31,23 @@ CONFIG_FILE = "master_config.json"
 # ============================================================================
 
 DEFAULT_CONFIG = {
-    # Identity
     "tenant_id":            "default_tenant",
     "unit_id":              "default_unit",
-
-    # Network
     "wifi_ssid":            "",
     "wifi_password":        "",
-
-    # MQTT — Phase 6
     "mqtt_broker":          "",
     "mqtt_port":            1883,
     "mqtt_username":        "",
     "mqtt_password":        "",
     "mqtt_enabled":         False,
-
-    # Booking window — UTC datetime strings
     "check_in_utc":         "2000-01-01 00:00:00",
     "check_out_utc":        "2000-01-01 00:00:00",
-
-    # Buffer period in minutes
     "buffer_minutes":       15,
-
-    # Manual UTC clock override — kept for offline testing fallback
     "use_manual_utc_now":   False,
     "manual_utc_now":       "2000-01-01 00:00:00",
-
-    # Persisted runtime state
     "last_sensor_status":   "vacant",
     "last_decided_status":  "Vacant",
     "last_scheduler_status": None,
-
-    # PZEM meter last readings — Phase 5
     "pzem_last_readings": {
         "MAIN": 0.0,
         "R1M":  0.0,
@@ -73,8 +59,6 @@ DEFAULT_CONFIG = {
         "R7M":  0.0,
         "R8M":  0.0
     },
-
-    # Sensor Hub configurable parameters
     "sensor_hub_config": {
         "pairing_duration_sec":      120,
         "watchdog_enable":           True,
