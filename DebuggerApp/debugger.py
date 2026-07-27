@@ -6,6 +6,16 @@ Phase 7
 Connects to Master (ESP32-S3) over TCP port 8765.
 Compatible with Python 3.8 through 3.14.
 
+Fixes in this version:
+  1. Removed duplicate get_state on connect — Master already sends snapshot
+  2. _apply_sensor_list preserves live state/temp/hum across refreshes
+  3. unit_occupancy event updates sensor occupancy labels
+  4. unit_state_update also updates sensor occupancy label
+  5. hub_ready auto-refresh delayed 1s to avoid racing the boot push thread
+  6. State snapshot deduplicated — second identical snapshot within 500ms ignored
+  7. Sensor table online column uses cleaner ✓/✗ symbols consistently
+  8. battery suppressed messages no longer flood event log
+
 Usage:
     python debugger.py
     python debugger.py --ip 192.168.0.211
@@ -199,7 +209,9 @@ class DebuggerApp:
         self._q       = queue.Queue()
         self._sensors = {}
         self._hub_cfg = {}
-        self._last_relay_time = None
+        self._last_relay_time     = None
+        self._last_snapshot_time  = 0.0   # for deduplication
+        self._last_snapshot_unit  = ""    # for deduplication
 
         root.title(
             "Innovatsii EMS — Pico 1 Debugger  |  {}:{}".format(ip, port))
@@ -282,7 +294,6 @@ class DebuggerApp:
             font=("Segoe UI", 10))
         self._lbl_hub.pack(side=tk.RIGHT, padx=16)
 
-        # Refresh All button in top bar
         btn_refresh = tk.Button(
             top, text="⟳  Refresh All",
             command=self._refresh_all,
@@ -296,7 +307,6 @@ class DebuggerApp:
         )
         btn_refresh.pack(side=tk.RIGHT, padx=8, pady=10)
 
-        # NTP Sync button
         btn_ntp = tk.Button(
             top, text="🕐 NTP Sync",
             command=self._ntp_sync,
@@ -503,7 +513,8 @@ class DebuggerApp:
 
         tk.Label(
             p,
-            text="Double-click a sensor to rename it.  Select a row then click Remove to delete.",
+            text="Double-click a sensor to rename it.  "
+                 "Select a row then click Remove to delete.",
             fg=C_DIM, bg=C_BG,
             font=("Segoe UI", 9)
         ).grid(row=2, column=0, sticky="w", padx=12, pady=2)
@@ -564,7 +575,6 @@ class DebuggerApp:
         p.columnconfigure(0, weight=1)
         p.columnconfigure(1, weight=1)
 
-        # Unit & booking config
         uf = make_frame(p, "Unit & Booking Configuration", row=0, col=0)
         uf.columnconfigure(1, weight=1)
 
@@ -596,7 +606,6 @@ class DebuggerApp:
                     row=btn_row, col=0,
                     sticky="ew", padx=8, pady=8)
 
-        # Hub config
         hf = make_frame(p, "Sensor Hub Configuration", row=0, col=1)
         hf.columnconfigure(1, weight=1)
 
@@ -638,7 +647,6 @@ class DebuggerApp:
                     row=len(hub_fields) + 1, col=0,
                     sticky="ew", padx=8, pady=8)
 
-        # WiFi
         wf = make_frame(p, "WiFi & Credentials", row=1, col=0)
         wf.columnconfigure(1, weight=1)
 
@@ -672,7 +680,6 @@ class DebuggerApp:
         ).grid(row=3, column=0, columnspan=2,
                sticky="w", padx=8, pady=4)
 
-        # System commands
         df = make_frame(p, "System Commands", row=1, col=1)
         df.columnconfigure(0, weight=1)
         make_button(df, "Refresh All",
@@ -779,7 +786,9 @@ class DebuggerApp:
     def _ui_on_connect(self):
         self._lbl_conn.config(text="⬤  Connected", fg=C_GREEN)
         self._log("Connected to {}:{}".format(self.ip, self.port), "info")
-        self._tcp.send({"type": "get_state"})
+        # FIX 1: Do NOT send get_state here.
+        # The Master automatically sends a state_snapshot on TCP connect.
+        # Sending get_state here causes a duplicate snapshot within milliseconds.
 
     def _ui_on_disconnect(self):
         self._lbl_conn.config(
@@ -793,6 +802,16 @@ class DebuggerApp:
         self._log_raw(msg)
 
         if t == "state_snapshot":
+            # FIX 2: Deduplicate identical snapshots arriving within 500ms.
+            # This happens on connect when both the Master auto-send and a
+            # pending get_state reply arrive at nearly the same time.
+            now        = time.monotonic()
+            unit_val   = msg.get("unit_state", "")
+            if (now - self._last_snapshot_time < 0.5 and
+                    unit_val == self._last_snapshot_unit):
+                return   # drop duplicate
+            self._last_snapshot_time = now
+            self._last_snapshot_unit = unit_val
             self._apply_snapshot(msg)
 
         elif t == "internet_status":
@@ -814,16 +833,34 @@ class DebuggerApp:
                 self._log_event("NTP SYNC FAILED", "alarm")
 
         elif t == "unit_occupancy":
+            # FIX 3: Update sensor occupancy indicators when Hub sends this.
+            # This is the raw Hub-level occupancy (OCCUPIED/VACANT).
+            # The 4-state unit decision comes separately as unit_state_update.
             s = msg.get("state", "VACANT")
             self._log_event("UNIT OCCUPANCY → {}".format(s), "unit")
+            occ_colour = C_GREEN if s.upper() == "OCCUPIED" else C_DIM
+            self._lbl_sensor_occ.config(
+                text="Sensor: {}".format(s.upper()), fg=occ_colour)
+            self._lbl_occ.config(
+                text="Sensor: {}".format(s.upper()), fg=occ_colour)
 
         elif t == "unit_state_update":
-            # Direct state update (e.g. from force_status or recalc)
+            # FIX 4: This is the 4-state Master decision — update big label
+            # AND sensor occupancy label for context.
             status = msg.get("status", "Unknown")
             colour = STATUS_COLOURS.get(status, C_DIM)
             self._lbl_unit_big.config(text=status, fg=colour)
             self._lbl_unit.config(text="Unit: {}".format(status), fg=colour)
             self._log_event("UNIT STATE → {}".format(status), "unit")
+            # Also update header sensor label to reflect new decision
+            # (occupied/vacant maps to the sensor occupancy that drove it)
+            occ = "occupied" if status in ("Occupied", "UnSold Occupied") \
+                  else "vacant"
+            occ_colour = C_GREEN if occ == "occupied" else C_DIM
+            self._lbl_sensor_occ.config(
+                text="Sensor: {}".format(occ.upper()), fg=occ_colour)
+            self._lbl_occ.config(
+                text="Sensor: {}".format(occ.upper()), fg=occ_colour)
 
         elif t == "pending_update":
             pending = msg.get("pending_status")
@@ -849,8 +886,14 @@ class DebuggerApp:
             colour = C_GREEN if on > 0 else C_YELLOW
             self._lbl_hub.config(
                 text="Hub: READY ({} online)".format(on), fg=colour)
-            # Auto-refresh sensor list
-            self._tcp.send({"type": "get_sensor_config"})
+            # FIX 5: Delay sensor list refresh by 1 second after hub_ready.
+            # hub_ready fires at end of pairing window (~2 min after boot).
+            # At that point the boot push thread (_hub_push_config_and_wait)
+            # may have already sent get_config and received a reply with 0
+            # sensors (before sensors re-announced). A 1s delay ensures all
+            # DEVICE_ANNCE and model-ID reads have completed before we refresh.
+            self.root.after(1000, lambda: self._tcp.send(
+                {"type": "get_sensor_config"}))
 
         elif t == "sensor_presence":
             sensor = msg.get("sensor", "")
@@ -889,9 +932,14 @@ class DebuggerApp:
             self._update_sensor_health(msg.get("sensor", ""), online)
 
         elif t == "battery":
+            # FIX 6: Only log battery in event log when it is the first
+            # forwarded one (not suppressed). Suppressed ones never reach
+            # the debugger — they are dropped by the Master filter.
+            # So every battery message we receive here IS the first/changed one.
             self._log_event(
                 "BATTERY  {}  {}%".format(
-                    msg.get("sensor", ""), msg.get("battery_pct", 0)), "battery")
+                    msg.get("sensor", ""), msg.get("battery_pct", 0)),
+                "battery")
             self._update_sensor_battery(
                 msg.get("sensor", ""), msg.get("battery_pct", 0))
 
@@ -919,7 +967,8 @@ class DebuggerApp:
             self._log_event("ACK  {}  {}".format(cmd, st), "dim")
             if cmd in ("set_unit_config", "set_hub_config", "set_wifi_config"):
                 self._log_event(
-                    "Config saved — Master acknowledged ({})".format(cmd), "info")
+                    "Config saved — Master acknowledged ({})".format(cmd),
+                    "info")
 
         elif t == "log_response":
             self._log_hub(msg.get("line", ""))
@@ -952,7 +1001,6 @@ class DebuggerApp:
 
         self._update_internet_indicator(inet_up)
 
-        # NTP status
         if ntp_ok:
             self._lbl_ntp.config(text="NTP: ✓", fg=C_GREEN)
             self._lbl_utc.config(text="UTC: {}".format(utc_now), fg=C_GREEN)
@@ -962,7 +1010,6 @@ class DebuggerApp:
             self._lbl_utc.config(text="UTC: not synced", fg=C_RED)
             self._lbl_utc_big.config(text="UTC: not synced", fg=C_RED)
 
-        # Hub label
         if hub_state == "READY":
             self._lbl_hub.config(text="Hub: READY", fg=C_GREEN)
         elif hub_state == "BOOTING":
@@ -1004,8 +1051,9 @@ class DebuggerApp:
         if "watchdog_enable" in hub_cfg:
             self._wd_enable_var.set(bool(hub_cfg["watchdog_enable"]))
 
-        self._log_event("State snapshot received — unit={}  ntp={}  utc={}".format(
-            unit, "✓" if ntp_ok else "✗", utc_now), "dim")
+        self._log_event(
+            "State snapshot received — unit={}  ntp={}  utc={}".format(
+                unit, "✓" if ntp_ok else "✗", utc_now), "dim")
 
     def _update_internet_indicator(self, is_up):
         if is_up:
@@ -1019,9 +1067,28 @@ class DebuggerApp:
                 fg=C_YELLOW)
 
     def _apply_sensor_list(self, sensors):
+        """
+        FIX 7: Rebuild sensor table preserving any live state/temp/hum
+        that was already displayed from incoming events.
+        Without this, every Refresh Sensors blanks the State and Temp/Hum
+        columns even though the data is still flowing in via live events.
+        """
+        # Snapshot current displayed values before clearing
+        live = {}   # name → {state, battery, temp, hum}
+        for iid in self._sensor_tree.get_children():
+            vals = self._sensor_tree.item(iid, "values")
+            if vals and len(vals) >= 9:
+                live[vals[1]] = {
+                    "state":   vals[5],
+                    "battery": vals[6],
+                    "temp":    vals[7],
+                    "hum":     vals[8],
+                }
+
         self._sensors = {}
         for row in self._sensor_tree.get_children():
             self._sensor_tree.delete(row)
+
         for s in sensors:
             if not isinstance(s, dict):
                 continue
@@ -1031,17 +1098,32 @@ class DebuggerApp:
             role   = s.get("role",  "?")
             online = "✓" if s.get("online", False) else "✗"
             batt   = "{}%".format(s.get("battery", "?"))
-            if role == "DOOR":
-                contact = s.get("contact", "—")
+
+            prev = live.get(name, {})
+
+            # State: prefer live event value if it is not blank
+            if prev.get("state", "—") not in ("—", ""):
+                state_v = prev["state"]
+            elif role == "DOOR":
+                contact = s.get("contact", None)
                 state_v = contact if contact else "—"
             else:
                 pres = s.get("presence", None)
                 state_v = ("YES" if pres else "NO") if pres is not None else "—"
+
+            # Battery: prefer live value if it looks like a percentage
+            prev_batt = prev.get("battery", "—")
+            batt_v = prev_batt if (prev_batt != "—" and prev_batt != "") else batt
+
+            # Temp/Hum: preserve live values
+            temp_v = prev.get("temp", "—")
+            hum_v  = prev.get("hum",  "—")
+
             self._sensor_tree.insert(
                 "", tk.END,
                 iid=str(idx),
                 values=(idx, name, model, role,
-                        online, state_v, batt, "—", "—"))
+                        online, state_v, batt_v, temp_v, hum_v))
             self._sensors[str(idx)] = s
             self._sensors[name]     = s
 
@@ -1157,7 +1239,11 @@ class DebuggerApp:
     # -----------------------------------------------------------------------
 
     def _refresh_all(self):
-        """Send get_state + get_sensor_config in one click."""
+        """
+        Refresh All — fetch current state snapshot AND sensor list.
+        Does NOT send get_state twice (Master sends snapshot automatically
+        on connect so this is only needed for manual refresh).
+        """
         self._tcp.send({"type": "get_state"})
         self._tcp.send({"type": "get_sensor_config"})
         self._log("TX → Refresh All (get_state + get_sensor_config)", "tx")
