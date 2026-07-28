@@ -5,11 +5,21 @@
 # UART2 <-> Scheduler   — NOT INITIALISED (Phase 4)
 # TCP   <-> Debugger App (port 8765)
 #
-# Fixes in this version:
-#   - _hub_config_push_in_progress guard prevents duplicate config push threads
-#   - try/finally in _hub_push_config_and_wait ensures flag always resets
-#   - Scheduler UART fully disabled — no Pin objects on GPIO18/21
-#   - Raw hex debug logging on TX and RX for diagnosis
+# Fixes in this version vs previous:
+#   FIX 1: Raw hex debug logging removed from TX and RX paths
+#   FIX 2: needs_pairing field used in _handle_hub_ready instead of
+#           offline>0 and online==0 check — prevents spurious pairing
+#           window on every hub reboot
+#   FIX 3: _handle_hub_boot check-then-set guard made atomic using
+#           _state_lock to prevent duplicate config push threads on
+#           rapid hub_boot arrivals
+#   FIX 4: TCP server thread guarded by _tcp_server_started flag —
+#           prevents multiple server threads accumulating on WiFi
+#           reconnects
+#   FIX 5: _handle_hub_ready delayed pairing moved to background thread —
+#           RX handler no longer sleeps 300ms blocking the RX loop
+#   FIX 6: g_volatile_dirty equivalent — unit state recalc after
+#           internet status change already correctly locked
 
 import utime
 import ujson as json
@@ -46,10 +56,16 @@ uart_sensor = UART(cfg.SENSOR_UART_ID,
 # Scheduler UART — completely disabled until Phase 4
 uart_sched = None
 
+# Pre-allocated static receive buffers — never grow, never reallocate
 _rx_sensor_buf = bytearray(UART_RX_BUF_MAX)
 _rx_sched_buf  = bytearray(UART_RX_BUF_MAX)
 _rx_sensor_pos = 0
 _rx_sched_pos  = 0
+
+# Pre-allocated static TCP receive buffer
+# FIX 4 note: moved to module level so it is never a local variable
+# in the thread function (avoids thread stack pressure)
+_rx_tcp_buf = bytearray(TCP_RX_BUF_MAX)
 
 # ============================================================================
 # LOCKS
@@ -81,6 +97,11 @@ _ntp_synced      = False
 _last_ntp_sync   = 0
 _hub_config_ack_pending      = False
 _hub_config_push_in_progress = False   # guards against duplicate push threads
+
+# FIX 4: TCP server started flag — prevents multiple server threads
+# accumulating across WiFi reconnects. Once the server thread is started
+# it handles reconnecting clients via its accept() loop.
+_tcp_server_started = False
 
 # ============================================================================
 # PERSISTENT CONFIG
@@ -126,22 +147,24 @@ def save_config():
 
 # ============================================================================
 # UART TX HELPERS
+# FIX 1: Raw hex debug logging removed.
+# Previously every UART TX generated a " ".join() hex string allocation
+# which created constant heap pressure. Production build logs only the
+# message type and key fields.
 # ============================================================================
 
 def _uart_send(uart_obj, lock_obj, payload_dict):
     try:
         msg = json.dumps(payload_dict) + "\n"
-        print("MASTER TX RAW :", msg.rstrip())
-        raw_bytes = msg.encode("utf-8")
-        hex_str = " ".join("{:02x}".format(b) for b in raw_bytes)
-        print("MASTER TX HEX :", hex_str)
         with lock_obj:
-            uart_obj.write(raw_bytes)
+            uart_obj.write(msg.encode("utf-8"))
     except Exception as e:
         print("UART TX error:", repr(e))
 
 
 def send_to_sensor_hub(payload_dict):
+    msg_type = payload_dict.get("type", "?")
+    print("MASTER -> SENSORHUB: {}".format(msg_type))
     _uart_send(uart_sensor, _tx_sensor_lock, payload_dict)
 
 
@@ -179,11 +202,10 @@ def _sync_ntp():
         _ntp_synced    = True
         _last_ntp_sync = utime.ticks_ms()
         t = utime.localtime()
-        print("NTP: synced — UTC {}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
-              t[0], t[1], t[2], t[3], t[4], t[5]))
-        tcp_forward({"type": "ntp_status", "synced": True,
-                     "utc": "{}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
-                         t[0], t[1], t[2], t[3], t[4], t[5])})
+        utc_str = "{}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
+            t[0], t[1], t[2], t[3], t[4], t[5])
+        print("NTP: synced — UTC {}".format(utc_str))
+        tcp_forward({"type": "ntp_status", "synced": True, "utc": utc_str})
         return True
     except Exception as e:
         print("NTP: sync failed:", repr(e))
@@ -270,6 +292,11 @@ def schedule_buffered(status, now_ep):
 
 
 def recalc_and_act():
+    """
+    Called ONLY when _state_lock is already held by the caller.
+    Reads sensor status, decides 4-state result, applies immediately
+    or schedules with buffer.
+    """
     now_ep = now_epoch_utc()
     sensor = state["last_sensor_status"]
     target = decide_status(sensor, now_ep)
@@ -330,16 +357,13 @@ def hub_cmd_push_config():
     }
     _hub_config_ack_pending = True
     send_to_sensor_hub(payload)
-    print("MASTER -> SENSORHUB: set_config sent")
 
 
 def _hub_push_config_and_wait():
     """
-    Sends set_config to Hub and waits for ACK.
-    Uses try/finally to guarantee _hub_config_push_in_progress is always
-    cleared — even if an exception occurs inside the thread.
-    MicroPython _thread does not run finally on normal exit so we
-    explicitly clear at the end of both paths.
+    Background thread: sends set_config, waits for ACK, then sends get_config.
+    try/finally guarantees _hub_config_push_in_progress is always cleared
+    even if an exception occurs.
     """
     global _hub_config_ack_pending, _hub_config_push_in_progress
     try:
@@ -363,7 +387,7 @@ def _hub_push_config_and_wait():
         print("HUB CONFIG: thread error:", repr(e))
     finally:
         _hub_config_push_in_progress = False
-        print("HUB CONFIG: push thread complete — lock released")
+        print("HUB CONFIG: push thread complete")
 
 
 # ============================================================================
@@ -559,12 +583,10 @@ def _handle_log_response(msg):
 
 def _handle_hub_boot(msg):
     """
-    Called every time a hub_boot message arrives.
-    Guard prevents spawning duplicate config-push threads if hub_boot
-    arrives again before the first push thread has completed.
-    If the Hub reboots while Master is running, the guard will have
-    been cleared by the previous thread's finally block, so a new
-    thread is spawned correctly.
+    FIX 3: check-then-set guard made atomic using _state_lock.
+    Without the lock two rapid hub_boot arrivals could both pass
+    the check before either set the flag, spawning duplicate threads.
+    The lock ensures only one thread can pass the check-then-set.
     """
     global _hub_state, _hub_config_push_in_progress
     _hub_state = "BOOTING"
@@ -574,31 +596,66 @@ def _handle_hub_boot(msg):
     print("HUB BOOT: sensor_count={} unit_state={} ts={}".format(
           count, msg.get("unit_state", "?"), msg.get("ts_utc", "?")))
 
-    if _hub_config_push_in_progress:
-        print("HUB BOOT: config push already in progress — skipping duplicate")
-        tcp_forward(msg)
-        return
+    with _state_lock:
+        if _hub_config_push_in_progress:
+            print("HUB BOOT: config push already in progress — skipping duplicate")
+            tcp_forward(msg)
+            return
+        _hub_config_push_in_progress = True
 
-    print("HUB BOOT: sending config now")
-    _hub_config_push_in_progress = True
+    print("HUB BOOT: spawning config push thread")
     _thread.start_new_thread(_hub_push_config_and_wait, ())
     tcp_forward(msg)
 
 
 def _handle_hub_ready(msg):
+    """
+    FIX 2: Use needs_pairing field instead of offline_count > 0 check.
+
+    OLD BEHAVIOUR (wrong):
+        if offline > 0 and online == 0: open pairing
+    After every Hub reboot all sensors start OFFLINE for 30-60s while
+    they rejoin automatically. This condition was always true at boot
+    so a pairing window was incorrectly opened on every reboot,
+    interrupting the automatic rejoin sequence and causing sensors
+    to re-pair as new devices and lose their assigned names.
+
+    NEW BEHAVIOUR (correct):
+        if needs_pairing: open pairing
+    needs_pairing=true is only sent when the sensor registry is empty
+    (fresh install or after factory reset). On normal reboots the Hub
+    sends needs_pairing=false and sensors rejoin automatically — no
+    pairing window needed.
+
+    FIX 5: Pairing window open moved to background thread.
+    The 300ms sleep was previously blocking the RX loop, meaning
+    any Hub UART bytes arriving during that window could overflow
+    the hardware buffer. The background thread sleeps 300ms outside
+    the RX loop without blocking it.
+    """
     global _hub_state
     _hub_state = "READY"
-    online  = msg.get("online_count", 0)
-    offline = msg.get("offline_count", 0)
-    if not isinstance(online,  int): online  = 0
-    if not isinstance(offline, int): offline = 0
-    print("HUB READY: online={} offline={} unit={} ts={}".format(
-          online, offline, msg.get("unit_state", "?"), msg.get("ts_utc", "?")))
+    online        = msg.get("online_count",  0)
+    offline       = msg.get("offline_count", 0)
+    needs_pairing = msg.get("needs_pairing", False)
+    if not isinstance(online,        int):  online        = 0
+    if not isinstance(offline,       int):  offline       = 0
+    if not isinstance(needs_pairing, bool): needs_pairing = False
+    print("HUB READY: online={} offline={} needs_pairing={} unit={} ts={}".format(
+          online, offline, needs_pairing,
+          msg.get("unit_state", "?"), msg.get("ts_utc", "?")))
     tcp_forward(msg)
-    if offline > 0 and online == 0:
-        print("HUB READY: all sensors offline — opening 30s re-pair window")
-        utime.sleep_ms(300)
-        hub_cmd_start_pairing(30)
+
+    if needs_pairing:
+        print("HUB READY: sensor registry empty — "
+              "opening 30s pairing window in background")
+        def _delayed_open_pairing():
+            utime.sleep_ms(300)
+            hub_cmd_start_pairing(30)
+        _thread.start_new_thread(_delayed_open_pairing, ())
+    else:
+        print("HUB READY: sensors registered — "
+              "rejoin in progress, no pairing window needed")
 
 
 _SENSOR_MSG_HANDLERS = {
@@ -671,17 +728,14 @@ def hub_cmd_set_sensor_name(sensor_index, name):
         "sensor_index": sensor_index,
         "name":         name
     })
-    print("MASTER -> SENSORHUB: rename {} -> '{}'".format(sensor_index, name))
 
 
 def hub_cmd_get_config():
     send_to_sensor_hub({"type": "get_config"})
-    print("MASTER -> SENSORHUB: get_config")
 
 
 def hub_cmd_get_logs():
     send_to_sensor_hub({"type": "get_logs", "lines": 50})
-    print("MASTER -> SENSORHUB: get_logs")
 
 
 def hub_cmd_start_pairing(duration_sec=120):
@@ -691,22 +745,18 @@ def hub_cmd_start_pairing(duration_sec=120):
 
 def hub_cmd_stop_pairing():
     send_to_sensor_hub({"type": "stop_pairing"})
-    print("MASTER -> SENSORHUB: stop_pairing")
 
 
 def hub_cmd_remove_sensor(sensor_index):
     send_to_sensor_hub({"type": "remove_sensor", "sensor_index": sensor_index})
-    print("MASTER -> SENSORHUB: remove_sensor index={}".format(sensor_index))
 
 
 def hub_cmd_factory_reset():
     send_to_sensor_hub({"type": "factory_reset"})
-    print("MASTER -> SENSORHUB: factory_reset")
 
 
 def hub_cmd_restart():
     send_to_sensor_hub({"type": "restart"})
-    print("MASTER -> SENSORHUB: restart")
 
 
 # ============================================================================
@@ -818,11 +868,15 @@ def handle_tcp_command(msg):
             hub_cfg["watchdog_enable"] = bool(msg["watchdog_enable"])
         conf["sensor_hub_config"] = hub_cfg
         save_config()
-        # Re-use the same guarded push path
-        global _hub_config_push_in_progress
-        if not _hub_config_push_in_progress:
-            _hub_config_push_in_progress = True
-            _thread.start_new_thread(_hub_push_config_and_wait, ())
+        with _state_lock:
+            if not _hub_config_push_in_progress:
+                pass   # flag will be set atomically inside block below
+        # Atomic guard for set_hub_config push (same pattern as hub_boot)
+        with _state_lock:
+            global _hub_config_push_in_progress
+            if not _hub_config_push_in_progress:
+                _hub_config_push_in_progress = True
+                _thread.start_new_thread(_hub_push_config_and_wait, ())
         _tcp_send_ack("set_hub_config")
         print("HUB CONFIG updated and pushing to Hub")
         tcp_forward(build_state_snapshot())
@@ -869,17 +923,18 @@ def handle_tcp_command(msg):
 
 # ============================================================================
 # UART RX LOOPS
+# FIX 1: Raw hex logging removed from _process_uart_line and sensor_rx_loop.
+# Previously every received message generated a full hex dump via " ".join()
+# allocating a list on the MicroPython heap. At 9600 baud with regular
+# heartbeats and sensor events this created constant allocation pressure.
+# Production build now logs only the decoded ASCII message.
 # ============================================================================
 
 def _process_uart_line(line_bytes, handler_fn):
-    raw = bytes(line_bytes)
-    hex_str = " ".join("{:02x}".format(b) for b in raw)
-    print("MASTER RX HEX :", hex_str)
     try:
-        s = raw.decode("utf-8").strip()
-        print("MASTER RX ASCII:", s)
+        s = bytes(line_bytes).decode("utf-8").strip()
     except Exception:
-        print("MASTER RX ASCII: <UTF-8 decode failed>")
+        print("WARN: UART RX UTF-8 decode failed")
         return False
     if not s:
         return False
@@ -902,13 +957,11 @@ def sensor_rx_loop():
             if uart_sensor.any():
                 data = uart_sensor.read()
                 if data:
-                    hex_str = " ".join("{:02x}".format(b) for b in data)
-                    print("MASTER RX RAW [{} bytes]: {}".format(
-                          len(data), hex_str))
-
                     for b in data:
                         ch = b if isinstance(b, int) else ord(b)
 
+                        # EMI noise filter: non-printable bytes (except
+                        # tab, LF, CR) reset the accumulation buffer
                         if ch < 0x20 and ch != 0x09 \
                                      and ch != 0x0A \
                                      and ch != 0x0D:
@@ -987,7 +1040,23 @@ def pending_worker():
 
 # ============================================================================
 # TCP DEBUG SERVER
+# FIX 4: TCP server guarded by _tcp_server_started flag.
+# Previously the server thread was started inside the WiFi reconnect loop.
+# If WiFi dropped and reconnected, a second server thread would start.
+# MicroPython provides no mechanism to stop a running thread, so over a
+# long deployment with unreliable WiFi this would accumulate multiple server
+# threads all trying to accept on the same port, causing unpredictable
+# behaviour. The flag ensures only one server thread ever exists.
 # ============================================================================
+
+def _maybe_start_tcp_server():
+    """Start the TCP server thread exactly once across all reconnects."""
+    global _tcp_server_started
+    if not _tcp_server_started:
+        _tcp_server_started = True
+        _thread.start_new_thread(tcp_server_thread, ())
+        print("TCP: server thread started on port {}".format(TCP_PORT))
+
 
 def tcp_server_thread():
     global _tcp_client
@@ -996,8 +1065,7 @@ def tcp_server_thread():
     srv.bind(socket.getaddrinfo("0.0.0.0", TCP_PORT)[0][-1])
     srv.listen(1)
     print("DEBUG: TCP server listening on port {}".format(TCP_PORT))
-    _rx_tcp_buf = bytearray(TCP_RX_BUF_MAX)
-    rx_pos      = 0
+    rx_pos = 0
     while True:
         try:
             conn, addr = srv.accept()
@@ -1118,8 +1186,9 @@ def wifi_and_internet_thread():
                 if wlan.isconnected():
                     cfg_info = wlan.ifconfig()
                     _wifi_ip = cfg_info[0]
-                    print("WIFI: connected IP={}".format(_wifi_ip))
-                    _thread.start_new_thread(tcp_server_thread, ())
+                    print("WIFI: reconnected IP={}".format(_wifi_ip))
+                    # FIX 4: use guard function — does NOT start a second thread
+                    _maybe_start_tcp_server()
                     break
             except Exception as e:
                 print("WIFI retry error:", repr(e))
@@ -1132,7 +1201,8 @@ def wifi_and_internet_thread():
         print("  Subnet  :", cfg_info[1])
         print("  Gateway :", cfg_info[2])
         print("  DNS     :", cfg_info[3])
-        _thread.start_new_thread(tcp_server_thread, ())
+        # FIX 4: use guard function
+        _maybe_start_tcp_server()
 
     retries = 3
     internet_found = False

@@ -10,6 +10,12 @@
 #   - Atomic config save (write-to-tmp then rename)
 #   - factory_reset and restart commands handled
 #   - All exception paths explicitly handled
+#
+# FIX: UART_BAUD changed from 115200 to 9600 to match system-wide
+#      baud rate. The entire system communicates at 9600 baud for
+#      EMI noise immunity (Zigbee 802.15.4 RF coupling on UART RX
+#      pins causes framing errors at 115200). This must match the
+#      Master's SCHED_UART_BAUD = 9600 in master_config.py.
 
 import utime
 import ujson as json
@@ -21,18 +27,18 @@ import config
 # ---------------- SETTINGS ----------------
 RELAY_PINS   = [4, 5, 16, 17, 18, 21, 35, 36, 37, 38]
 UART_ID      = 1
-UART_BAUD    = 115200
-UART_TX_PIN  = 12    # Scheduler TX -> Master RX (GPIO21)
-UART_RX_PIN  = 11    # Scheduler RX <- Master TX (GPIO18)  ← fixed from 13
+UART_BAUD    = 9600    # FIX: was 115200 — must match Master SCHED_UART_BAUD
+UART_TX_PIN  = 12      # Scheduler TX -> Master RX (GPIO21)
+UART_RX_PIN  = 11      # Scheduler RX <- Master TX (GPIO18)
 UART_RX_BUF  = 512
 # ------------------------------------------
 
-relays             = []
-current_config     = {}
-state_lock         = _thread.allocate_lock()
-relay_state        = [None] * len(RELAY_PINS)
+relays              = []
+current_config      = {}
+state_lock          = _thread.allocate_lock()
+relay_state         = [None] * len(RELAY_PINS)
 last_applied_status = None
-uart               = None
+uart                = None
 last_telemetry_json = None
 last_telemetry_ms   = 0
 
@@ -113,8 +119,8 @@ def parse_schedule(cmd):
             off_s = parse_duration_to_seconds(between)
             if on_s > 0 and off_s > 0:
                 return ("cycle", on_s, off_s)
-    except Exception:
-        pass
+    except Exception as e:
+        print("Scheduler: parse_schedule error for '{}': {}".format(cmd, e))
     return ("always_off",)
 
 
@@ -206,17 +212,17 @@ def send_scheduler_update(force=False):
     with state_lock:
         status = current_config.get("currentStatus", "Vacant")
     payload = {
-        "type":    "scheduler_update",
-        "status":  status,
-        "relays":  get_relay_snapshot(),
-        "ts_utc":  utime.time()
+        "type":   "scheduler_update",
+        "status": status,
+        "relays": get_relay_snapshot(),
+        "ts_utc": utime.time()
     }
     try:
         msg = json.dumps(payload)
     except Exception:
         return
-    now          = utime.ticks_ms()
-    changed      = (msg != last_telemetry_json)
+    now           = utime.ticks_ms()
+    changed       = (msg != last_telemetry_json)
     heartbeat_due = utime.ticks_diff(now, last_telemetry_ms) > 5000
     if force or changed or heartbeat_due:
         try:
@@ -312,12 +318,12 @@ def uart_rx_loop():
                                         print("Scheduler: invalid set_status payload")
 
                                 elif t == "restart":
-                                    print("Scheduler: restart command received — rebooting")
+                                    print("Scheduler: restart command — rebooting")
                                     utime.sleep_ms(200)
                                     reset()
 
                                 elif t == "factory_reset":
-                                    print("Scheduler: factory_reset — erasing config and rebooting")
+                                    print("Scheduler: factory_reset — erasing config")
                                     for fname in (config.CONFIG_FILE,
                                                   config.CONFIG_FILE + ".tmp"):
                                         try:
