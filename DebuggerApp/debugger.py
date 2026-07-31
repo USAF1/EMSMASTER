@@ -3,32 +3,15 @@
 debugger.py — Innovatsii EMS Pico 1 Desktop Debugger
 Version: 0.2.5
 
-Connects to Master (ESP32-S3) over TCP port 8765.
-Compatible with Python 3.8 through 3.14.
-
-Changes in v0.2.5:
-  - Force command dialog — asks for duration (1-24 hours) and optional reason
-  - Force indicator panel on Dashboard — shows status, expiry, reason
-  - Cancel Force button in force panel
-  - force_update message handler
-  - hub_boot handler removed (no longer sent by Hub)
-  - hub_ready updated — firmware_version, needs_pairing alert
-  - sensor_joined, sensor_status, sensor_list_complete handlers added
-  - new_sensor_joined, pairing_complete handlers added
-  - boot_phase handler — progress indicator in header
-  - boot_fault handler — shows fault reason, marks hub FAULT
-  - notification handler — info/warning/error alerts in event log
-  - Hub state FAULT added
-  - Firmware version shown in header
-  - Boot phase shown in header
-  - Config tab: presence_fading_time_sec, door_sensor_max_silence_hours added
-  - _apply_snapshot: restores force indicator on reconnect
-  - Start Watchdog button added to Hub Control panel
-
-Usage:
-    python debugger.py
-    python debugger.py --ip 192.168.0.211
-    python debugger.py --ip 192.168.0.211 --port 8765
+Fixes in this version:
+  - unit_state_update no longer overwrites the Sensor occupancy label.
+    The sensor label shows raw sensor state (from unit_occupancy and
+    state_snapshot only). Previously it inferred sensor state from the
+    4-state booking decision — causing "Sensor: OCCUPIED" to stay stuck
+    even when all sensors reported vacant, because "UnSold Occupied"
+    mapped to "occupied" in the inference logic.
+  - Force button TypeError resolved — ForceDurationDialog is correctly
+    used in _force_status() method.
 """
 
 import socket
@@ -208,17 +191,13 @@ def make_button(parent, text, cmd, fg=C_TEXT,
 # ============================================================================
 
 class ForceDurationDialog(simpledialog.Dialog):
-    """
-    Modal dialog that asks for force duration (hours) and optional reason.
-    Minimum 1 hour. Maximum 24 hours.
-    """
+    """Modal dialog — asks for force duration (hours) and optional reason."""
 
     def __init__(self, parent, status):
         self.status        = status
         self.result_hours  = None
         self.result_reason = None
-        super().__init__(parent,
-                         title="Force: {}".format(status))
+        super().__init__(parent, title="Force: {}".format(status))
 
     def body(self, master):
         master.configure(bg=C_BG)
@@ -233,45 +212,33 @@ class ForceDurationDialog(simpledialog.Dialog):
                sticky="w", padx=12, pady=(12, 6))
 
         tk.Label(
-            master,
-            text="Duration (hours, 1–24):",
-            fg=C_TEXT, bg=C_BG,
-            font=("Segoe UI", 10)
+            master, text="Duration (hours, 1–24):",
+            fg=C_TEXT, bg=C_BG, font=("Segoe UI", 10)
         ).grid(row=1, column=0, sticky="w", padx=12, pady=4)
 
         self._hours_var = tk.StringVar(value="2")
         hours_entry = tk.Entry(
-            master,
-            textvariable=self._hours_var,
-            bg=C_PANEL, fg=C_TEXT,
-            insertbackground=C_TEXT,
-            font=("Segoe UI", 10), width=8
-        )
+            master, textvariable=self._hours_var,
+            bg=C_PANEL, fg=C_TEXT, insertbackground=C_TEXT,
+            font=("Segoe UI", 10), width=8)
         hours_entry.grid(row=1, column=1, sticky="w", padx=12, pady=4)
 
         tk.Label(
-            master,
-            text="Reason (optional):",
-            fg=C_TEXT, bg=C_BG,
-            font=("Segoe UI", 10)
+            master, text="Reason (optional):",
+            fg=C_TEXT, bg=C_BG, font=("Segoe UI", 10)
         ).grid(row=2, column=0, sticky="w", padx=12, pady=4)
 
         self._reason_var = tk.StringVar(value="")
         reason_entry = tk.Entry(
-            master,
-            textvariable=self._reason_var,
-            bg=C_PANEL, fg=C_TEXT,
-            insertbackground=C_TEXT,
-            font=("Segoe UI", 10), width=28
-        )
+            master, textvariable=self._reason_var,
+            bg=C_PANEL, fg=C_TEXT, insertbackground=C_TEXT,
+            font=("Segoe UI", 10), width=28)
         reason_entry.grid(row=2, column=1, sticky="w", padx=12, pady=4)
 
         tk.Label(
             master,
-            text="Overrides all sensor and booking logic\n"
-                 "for the specified duration.",
-            fg=C_DIM, bg=C_BG,
-            font=("Segoe UI", 9), justify=tk.LEFT
+            text="Overrides all sensor and booking logic\nfor the specified duration.",
+            fg=C_DIM, bg=C_BG, font=("Segoe UI", 9), justify=tk.LEFT
         ).grid(row=3, column=0, columnspan=2,
                sticky="w", padx=12, pady=(4, 12))
 
@@ -305,9 +272,8 @@ class DebuggerApp:
         self._last_snapshot_time  = 0.0
         self._last_snapshot_unit  = ""
 
-        # Force state tracked locally for UI updates
         self._force_active  = False
-        self._force_status  = ""
+        self._force_status_val  = ""   # renamed to avoid clash with method
         self._force_expires = ""
         self._force_reason  = ""
 
@@ -334,7 +300,6 @@ class DebuggerApp:
     # -----------------------------------------------------------------------
 
     def _build_ui(self):
-        # ── Top bar ──────────────────────────────────────────────────────────
         top = tk.Frame(self.root, bg=C_PANEL, height=62)
         top.pack(fill=tk.X)
         top.pack_propagate(False)
@@ -381,7 +346,6 @@ class DebuggerApp:
             font=("Segoe UI", 10))
         self._lbl_pending.pack(side=tk.LEFT, padx=10)
 
-        # RIGHT side of top bar
         self._lbl_ip = tk.Label(
             top, text="IP: —",
             fg=C_DIM, bg=C_PANEL,
@@ -410,29 +374,20 @@ class DebuggerApp:
             top, text="⟳  Refresh All",
             command=self._refresh_all,
             bg=C_BORDER, fg=C_BLUE,
-            activebackground=C_PANEL,
-            activeforeground=C_BLUE,
-            relief=tk.FLAT,
-            font=("Segoe UI", 9, "bold"),
-            cursor="hand2",
-            padx=10, pady=4
-        )
+            activebackground=C_PANEL, activeforeground=C_BLUE,
+            relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
+            cursor="hand2", padx=10, pady=4)
         btn_refresh.pack(side=tk.RIGHT, padx=8, pady=10)
 
         btn_ntp = tk.Button(
             top, text="🕐 NTP Sync",
             command=self._ntp_sync,
             bg=C_BORDER, fg=C_TEAL,
-            activebackground=C_PANEL,
-            activeforeground=C_TEAL,
-            relief=tk.FLAT,
-            font=("Segoe UI", 9),
-            cursor="hand2",
-            padx=8, pady=4
-        )
+            activebackground=C_PANEL, activeforeground=C_TEAL,
+            relief=tk.FLAT, font=("Segoe UI", 9),
+            cursor="hand2", padx=8, pady=4)
         btn_ntp.pack(side=tk.RIGHT, padx=4, pady=10)
 
-        # ── Notebook ─────────────────────────────────────────────────────────
         style = ttk.Style()
         style.theme_use("default")
         style.configure("TNotebook", background=C_BG, borderwidth=0)
@@ -482,7 +437,6 @@ class DebuggerApp:
         p.columnconfigure(2, weight=1)
         p.rowconfigure(2, weight=1)
 
-        # ── Unit State panel ─────────────────────────────────────────────────
         uf = make_frame(p, "Unit Occupancy State", row=0, col=0)
         uf.columnconfigure(0, weight=1)
 
@@ -498,8 +452,7 @@ class DebuggerApp:
 
         self._lbl_inet_mode = tk.Label(
             uf, text="Mode: waiting...",
-            fg=C_YELLOW, bg=C_BG,
-            font=("Segoe UI", 10))
+            fg=C_YELLOW, bg=C_BG, font=("Segoe UI", 10))
         self._lbl_inet_mode.grid(row=2, column=0, pady=2)
 
         self._lbl_utc_big = tk.Label(
@@ -512,7 +465,6 @@ class DebuggerApp:
             font=("Segoe UI", 10))
         self._lbl_pending2.grid(row=4, column=0, pady=2)
 
-        # ── Quick Actions panel ───────────────────────────────────────────────
         qf = make_frame(p, "Quick Actions", row=0, col=1)
         qf.columnconfigure(0, weight=1)
         for i, (label, status) in enumerate([
@@ -523,7 +475,7 @@ class DebuggerApp:
         ]):
             colour = STATUS_COLOURS.get(status, C_TEXT)
             make_button(qf, label,
-                        lambda s=status: self._force_status(s),
+                        lambda s=status: self._do_force_status(s),
                         fg=colour, row=i, col=0,
                         sticky="ew", padx=8, pady=3)
         make_button(qf, "Cancel Pending",
@@ -531,7 +483,6 @@ class DebuggerApp:
                     fg=C_YELLOW, row=4, col=0,
                     sticky="ew", padx=8, pady=6)
 
-        # ── Hub Control panel ─────────────────────────────────────────────────
         hf = make_frame(p, "Sensor Hub Control", row=0, col=2)
         hf.columnconfigure(0, weight=1)
         make_button(hf, "Open Pairing (120s)",
@@ -553,16 +504,11 @@ class DebuggerApp:
                     self._restart_hub,
                     fg=C_YELLOW, row=5, col=0, sticky="ew", padx=8, pady=3)
 
-        # ── Force Indicator panel (hidden when not active) ────────────────────
         self._force_frame = tk.LabelFrame(
-            p,
-            text="  ⚠  FORCE ACTIVE  ",
+            p, text="  ⚠  FORCE ACTIVE  ",
             bg=C_BG, fg=C_ORANGE,
             font=("Segoe UI", 10, "bold"),
-            bd=2, relief=tk.GROOVE,
-            labelanchor="nw"
-        )
-        # Placed at row=1 spanning all columns — hidden by default
+            bd=2, relief=tk.GROOVE, labelanchor="nw")
         self._force_frame.grid(row=1, column=0, columnspan=3,
                                 sticky="ew", padx=8, pady=4)
         self._force_frame.columnconfigure(0, weight=1)
@@ -570,24 +516,22 @@ class DebuggerApp:
         self._force_frame.columnconfigure(2, weight=1)
         self._force_frame.columnconfigure(3, weight=0)
 
-        self._lbl_force_status = tk.Label(
+        self._lbl_force_status_widget = tk.Label(
             self._force_frame, text="Status: —",
             fg=C_ORANGE, bg=C_BG,
             font=("Segoe UI", 11, "bold"))
-        self._lbl_force_status.grid(row=0, column=0,
-                                     sticky="w", padx=12, pady=6)
+        self._lbl_force_status_widget.grid(row=0, column=0,
+                                            sticky="w", padx=12, pady=6)
 
         self._lbl_force_expires = tk.Label(
             self._force_frame, text="Expires: —",
-            fg=C_YELLOW, bg=C_BG,
-            font=("Segoe UI", 10))
+            fg=C_YELLOW, bg=C_BG, font=("Segoe UI", 10))
         self._lbl_force_expires.grid(row=0, column=1,
                                       sticky="w", padx=12, pady=6)
 
         self._lbl_force_reason = tk.Label(
             self._force_frame, text="Reason: —",
-            fg=C_DIM, bg=C_BG,
-            font=("Segoe UI", 10))
+            fg=C_DIM, bg=C_BG, font=("Segoe UI", 10))
         self._lbl_force_reason.grid(row=0, column=2,
                                      sticky="w", padx=12, pady=6)
 
@@ -596,20 +540,14 @@ class DebuggerApp:
             text="  Cancel Force  ",
             command=self._cancel_force,
             bg=C_RED, fg=C_BG,
-            activebackground=C_ORANGE,
-            activeforeground=C_BG,
-            relief=tk.FLAT,
-            font=("Segoe UI", 9, "bold"),
-            cursor="hand2",
-            padx=10, pady=4
-        )
+            activebackground=C_ORANGE, activeforeground=C_BG,
+            relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
+            cursor="hand2", padx=10, pady=4)
         self._btn_cancel_force.grid(row=0, column=3,
                                      sticky="e", padx=12, pady=6)
 
-        # Initially hide the force frame
         self._force_frame.grid_remove()
 
-        # ── Live Events ───────────────────────────────────────────────────────
         ef = make_frame(p, "Live Events",
                         row=2, col=0, colspan=3, sticky="nsew")
         ef.columnconfigure(0, weight=1)
@@ -618,29 +556,19 @@ class DebuggerApp:
         self._event_log = scrolledtext.ScrolledText(
             ef, bg="#11111b", fg=C_TEXT,
             font=("Courier New", 9),
-            state=tk.DISABLED, wrap=tk.WORD,
-            height=14)
-        self._event_log.grid(row=0, column=0,
-                              sticky="nsew", padx=4, pady=4)
+            state=tk.DISABLED, wrap=tk.WORD, height=14)
+        self._event_log.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+
         for tag, colour in [
-            ("door",         C_BLUE),
-            ("presence",     C_GREEN),
-            ("alarm",        C_RED),
-            ("health",       C_ORANGE),
-            ("battery",      C_YELLOW),
-            ("env",          C_TEAL),
-            ("unit",         C_PURPLE),
-            ("hub",          C_BLUE),
-            ("inet",         C_ORANGE),
-            ("ntp",          C_TEAL),
-            ("dim",          C_DIM),
-            ("info",         C_TEXT),
-            ("sched",        C_TEAL),
-            ("force",        C_ORANGE),
-            ("boot",         C_YELLOW),
-            ("warn",         C_YELLOW),
-            ("error",        C_RED),
-            ("notification", C_ORANGE),
+            ("door",         C_BLUE),   ("presence",     C_GREEN),
+            ("alarm",        C_RED),    ("health",       C_ORANGE),
+            ("battery",      C_YELLOW), ("env",          C_TEAL),
+            ("unit",         C_PURPLE), ("hub",          C_BLUE),
+            ("inet",         C_ORANGE), ("ntp",          C_TEAL),
+            ("dim",          C_DIM),    ("info",         C_TEXT),
+            ("sched",        C_TEAL),   ("force",        C_ORANGE),
+            ("boot",         C_YELLOW), ("warn",         C_YELLOW),
+            ("error",        C_RED),    ("notification", C_ORANGE),
         ]:
             self._event_log.tag_config(tag, foreground=colour)
 
@@ -691,16 +619,14 @@ class DebuggerApp:
             self._sensor_tree.heading(col_id, text=heading)
             self._sensor_tree.column(col_id, width=width, anchor="center")
 
-        self._sensor_tree.grid(
-            row=1, column=0, sticky="nsew", padx=8, pady=4)
+        self._sensor_tree.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
         self._sensor_tree.bind("<Double-1>", self._on_sensor_double_click)
 
         tk.Label(
             p,
             text="Double-click a sensor to rename it.  "
                  "Select a row then click Remove to delete.",
-            fg=C_DIM, bg=C_BG,
-            font=("Segoe UI", 9)
+            fg=C_DIM, bg=C_BG, font=("Segoe UI", 9)
         ).grid(row=2, column=0, sticky="w", padx=12, pady=2)
 
     # -----------------------------------------------------------------------
@@ -715,10 +641,8 @@ class DebuggerApp:
             p.columnconfigure(i, weight=1)
 
         self._lbl_relay_header = tk.Label(
-            p,
-            text="Waiting for Scheduler data...",
-            fg=C_YELLOW, bg=C_BG,
-            font=("Segoe UI", 9))
+            p, text="Waiting for Scheduler data...",
+            fg=C_YELLOW, bg=C_BG, font=("Segoe UI", 9))
         self._lbl_relay_header.grid(
             row=0, column=0, columnspan=len(RELAY_KEYS),
             sticky="w", padx=12, pady=6)
@@ -727,26 +651,20 @@ class DebuggerApp:
         for i, key in enumerate(RELAY_KEYS):
             frame = tk.Frame(p, bg=C_PANEL, bd=1, relief=tk.GROOVE)
             frame.grid(row=1, column=i, sticky="nsew", padx=6, pady=8)
-            tk.Label(
-                frame, text=key,
-                fg=C_BLUE, bg=C_PANEL,
-                font=("Segoe UI", 11, "bold")
-            ).pack(pady=(10, 2))
-            lbl = tk.Label(
-                frame, text="—",
-                fg=C_DIM, bg=C_PANEL,
-                font=("Segoe UI", 14, "bold"))
+            tk.Label(frame, text=key,
+                     fg=C_BLUE, bg=C_PANEL,
+                     font=("Segoe UI", 11, "bold")).pack(pady=(10, 2))
+            lbl = tk.Label(frame, text="—",
+                           fg=C_DIM, bg=C_PANEL,
+                           font=("Segoe UI", 14, "bold"))
             lbl.pack(pady=(2, 10))
             self._relay_labels[key] = lbl
 
         self._lbl_sched_status = tk.Label(
-            p,
-            text="Scheduler status: —",
-            fg=C_TEXT, bg=C_BG,
-            font=("Segoe UI", 11))
+            p, text="Scheduler status: —",
+            fg=C_TEXT, bg=C_BG, font=("Segoe UI", 11))
         self._lbl_sched_status.grid(
-            row=2, column=0,
-            columnspan=len(RELAY_KEYS),
+            row=2, column=0, columnspan=len(RELAY_KEYS),
             sticky="w", padx=12, pady=8)
 
     # -----------------------------------------------------------------------
@@ -758,7 +676,6 @@ class DebuggerApp:
         p.columnconfigure(0, weight=1)
         p.columnconfigure(1, weight=1)
 
-        # Unit config
         uf = make_frame(p, "Unit & Booking Configuration", row=0, col=0)
         uf.columnconfigure(1, weight=1)
 
@@ -771,25 +688,20 @@ class DebuggerApp:
         ]
         self._cfg_entries = {}
         for r, (key, label) in enumerate(unit_fields):
-            tk.Label(
-                uf, text=label,
-                fg=C_TEXT, bg=C_BG,
-                font=("Segoe UI", 10)
-            ).grid(row=r, column=0, sticky="w", padx=8, pady=4)
-            e = tk.Entry(
-                uf, bg=C_PANEL, fg=C_TEXT,
-                insertbackground=C_TEXT,
-                font=("Segoe UI", 10), width=32)
+            tk.Label(uf, text=label, fg=C_TEXT, bg=C_BG,
+                     font=("Segoe UI", 10)
+                     ).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+            e = tk.Entry(uf, bg=C_PANEL, fg=C_TEXT,
+                         insertbackground=C_TEXT,
+                         font=("Segoe UI", 10), width=32)
             e.grid(row=r, column=1, sticky="ew", padx=8, pady=4)
             self._cfg_entries[key] = e
 
-        btn_row = len(unit_fields)
         make_button(uf, "Save Unit Config",
                     self._save_unit_config,
-                    fg=C_GREEN, row=btn_row, col=0,
+                    fg=C_GREEN, row=len(unit_fields), col=0,
                     sticky="ew", padx=8, pady=8)
 
-        # Hub config — now includes v0.2.5 fields
         hf = make_frame(p, "Sensor Hub Configuration", row=0, col=1)
         hf.columnconfigure(1, weight=1)
 
@@ -804,15 +716,12 @@ class DebuggerApp:
         ]
         self._hub_entries = {}
         for r, (key, label) in enumerate(hub_fields):
-            tk.Label(
-                hf, text=label,
-                fg=C_TEXT, bg=C_BG,
-                font=("Segoe UI", 10)
-            ).grid(row=r, column=0, sticky="w", padx=8, pady=4)
-            e = tk.Entry(
-                hf, bg=C_PANEL, fg=C_TEXT,
-                insertbackground=C_TEXT,
-                font=("Segoe UI", 10), width=20)
+            tk.Label(hf, text=label, fg=C_TEXT, bg=C_BG,
+                     font=("Segoe UI", 10)
+                     ).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+            e = tk.Entry(hf, bg=C_PANEL, fg=C_TEXT,
+                         insertbackground=C_TEXT,
+                         font=("Segoe UI", 10), width=20)
             e.grid(row=r, column=1, sticky="ew", padx=8, pady=4)
             self._hub_entries[key] = e
 
@@ -821,35 +730,28 @@ class DebuggerApp:
             hf, text="Watchdog enabled",
             variable=self._wd_enable_var,
             bg=C_BG, fg=C_TEXT,
-            activebackground=C_BG,
-            selectcolor=C_PANEL,
+            activebackground=C_BG, selectcolor=C_PANEL,
             font=("Segoe UI", 10)
         ).grid(row=len(hub_fields), column=0,
                columnspan=2, sticky="w", padx=8, pady=4)
 
         make_button(hf, "Save & Push to Hub",
                     self._save_hub_config,
-                    fg=C_GREEN,
-                    row=len(hub_fields) + 1, col=0,
+                    fg=C_GREEN, row=len(hub_fields) + 1, col=0,
                     sticky="ew", padx=8, pady=8)
 
-        # WiFi config
         wf = make_frame(p, "WiFi & Credentials", row=1, col=0)
         wf.columnconfigure(1, weight=1)
         for r, (key, label, show) in enumerate([
             ("wifi_ssid",     "WiFi SSID",     ""),
             ("wifi_password", "WiFi Password", "*"),
         ]):
-            tk.Label(
-                wf, text=label,
-                fg=C_TEXT, bg=C_BG,
-                font=("Segoe UI", 10)
-            ).grid(row=r, column=0, sticky="w", padx=8, pady=4)
-            e = tk.Entry(
-                wf, bg=C_PANEL, fg=C_TEXT,
-                insertbackground=C_TEXT,
-                font=("Segoe UI", 10), width=28,
-                show=show)
+            tk.Label(wf, text=label, fg=C_TEXT, bg=C_BG,
+                     font=("Segoe UI", 10)
+                     ).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+            e = tk.Entry(wf, bg=C_PANEL, fg=C_TEXT,
+                         insertbackground=C_TEXT,
+                         font=("Segoe UI", 10), width=28, show=show)
             e.grid(row=r, column=1, sticky="ew", padx=8, pady=4)
             self._cfg_entries[key] = e
 
@@ -858,41 +760,31 @@ class DebuggerApp:
                     fg=C_YELLOW, row=2, col=0,
                     sticky="ew", padx=8, pady=8)
 
-        tk.Label(
-            wf,
-            text="IP is assigned by router DHCP reservation.",
-            fg=C_DIM, bg=C_BG,
-            font=("Segoe UI", 9), justify=tk.LEFT
-        ).grid(row=3, column=0, columnspan=2,
-               sticky="w", padx=8, pady=4)
+        tk.Label(wf,
+                 text="IP is assigned by router DHCP reservation.",
+                 fg=C_DIM, bg=C_BG, font=("Segoe UI", 9), justify=tk.LEFT
+                 ).grid(row=3, column=0, columnspan=2,
+                        sticky="w", padx=8, pady=4)
 
-        # System commands
         df = make_frame(p, "System Commands", row=1, col=1)
         df.columnconfigure(0, weight=1)
-        make_button(df, "Refresh All",
-                    self._refresh_all,
-                    fg=C_BLUE, row=0, col=0, sticky="ew", padx=8, pady=4)
-        make_button(df, "NTP Sync Now",
-                    self._ntp_sync,
-                    fg=C_TEAL, row=1, col=0, sticky="ew", padx=8, pady=4)
-        make_button(df, "Start Watchdog",
-                    self._start_watchdog,
-                    fg=C_TEAL, row=2, col=0, sticky="ew", padx=8, pady=4)
-        make_button(df, "Restart Master",
-                    self._restart_master,
-                    fg=C_RED, row=3, col=0, sticky="ew", padx=8, pady=4)
-        make_button(df, "Restart Sensor Hub",
-                    self._restart_hub,
+        make_button(df, "Refresh All",       self._refresh_all,
+                    fg=C_BLUE,   row=0, col=0, sticky="ew", padx=8, pady=4)
+        make_button(df, "NTP Sync Now",      self._ntp_sync,
+                    fg=C_TEAL,   row=1, col=0, sticky="ew", padx=8, pady=4)
+        make_button(df, "Start Watchdog",    self._start_watchdog,
+                    fg=C_TEAL,   row=2, col=0, sticky="ew", padx=8, pady=4)
+        make_button(df, "Restart Master",    self._restart_master,
+                    fg=C_RED,    row=3, col=0, sticky="ew", padx=8, pady=4)
+        make_button(df, "Restart Sensor Hub",self._restart_hub,
                     fg=C_ORANGE, row=4, col=0, sticky="ew", padx=8, pady=4)
-        make_button(df, "Hub Factory Reset",
-                    self._hub_factory_reset,
-                    fg=C_RED, row=5, col=0, sticky="ew", padx=8, pady=4)
-        make_button(df, "Restart Scheduler",
-                    self._restart_scheduler,
+        make_button(df, "Hub Factory Reset", self._hub_factory_reset,
+                    fg=C_RED,    row=5, col=0, sticky="ew", padx=8, pady=4)
+        make_button(df, "Restart Scheduler", self._restart_scheduler,
                     fg=C_ORANGE, row=6, col=0, sticky="ew", padx=8, pady=4)
         make_button(df, "Scheduler Factory Reset",
                     self._scheduler_factory_reset,
-                    fg=C_RED, row=7, col=0, sticky="ew", padx=8, pady=4)
+                    fg=C_RED,    row=7, col=0, sticky="ew", padx=8, pady=4)
 
     # -----------------------------------------------------------------------
     # LOGS TAB
@@ -916,15 +808,12 @@ class DebuggerApp:
             p, bg="#11111b", fg=C_TEXT,
             font=("Courier New", 9),
             state=tk.DISABLED, wrap=tk.WORD)
-        self._log_box.grid(row=1, column=0,
-                           sticky="nsew", padx=8, pady=4)
+        self._log_box.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+
         for tag, colour in [
-            ("error",   C_RED),
-            ("warn",    C_YELLOW),
-            ("info",    C_TEXT),
-            ("rx",      C_TEAL),
-            ("tx",      C_PURPLE),
-            ("hub_log", C_ORANGE),
+            ("error",   C_RED),    ("warn",    C_YELLOW),
+            ("info",    C_TEXT),   ("rx",      C_TEAL),
+            ("tx",      C_PURPLE), ("hub_log", C_ORANGE),
             ("dim",     C_DIM),
         ]:
             self._log_box.tag_config(tag, foreground=colour)
@@ -975,7 +864,6 @@ class DebuggerApp:
     def _ui_on_connect(self):
         self._lbl_conn.config(text="⬤  Connected", fg=C_GREEN)
         self._log("Connected to {}:{}".format(self.ip, self.port), "info")
-        # Master sends state_snapshot automatically on connect — no get_state needed
 
     def _ui_on_disconnect(self):
         self._lbl_conn.config(
@@ -989,18 +877,16 @@ class DebuggerApp:
         t = msg.get("type", "")
         self._log_raw(msg)
 
-        # ── State snapshot ────────────────────────────────────────────────────
         if t == "state_snapshot":
             now      = time.monotonic()
             unit_val = msg.get("unit_state", "")
             if (now - self._last_snapshot_time < 0.5 and
                     unit_val == self._last_snapshot_unit):
-                return   # deduplicate
+                return
             self._last_snapshot_time = now
             self._last_snapshot_unit = unit_val
             self._apply_snapshot(msg)
 
-        # ── Internet / NTP ────────────────────────────────────────────────────
         elif t == "internet_status":
             up = msg.get("status", "") == "up"
             self._update_internet_indicator(up)
@@ -1020,7 +906,6 @@ class DebuggerApp:
                 self._lbl_ntp.config(text="NTP: ✗", fg=C_RED)
                 self._log_event("NTP SYNC FAILED", "alarm")
 
-        # ── Boot protocol (v0.2.5) ────────────────────────────────────────────
         elif t == "boot_phase":
             phase = msg.get("phase", "")
             phase_labels = {
@@ -1043,24 +928,19 @@ class DebuggerApp:
         elif t == "boot_fault":
             reason = msg.get("reason", "Unknown")
             self._lbl_hub.config(text="Hub: FAULT", fg=C_RED)
-            self._lbl_boot_phase.config(
-                text="⚠ Hub FAULT", fg=C_RED)
-            self._log_event(
-                "⚠ HUB FAULT — {}".format(reason), "error")
+            self._lbl_boot_phase.config(text="⚠ Hub FAULT", fg=C_RED)
+            self._log_event("⚠ HUB FAULT — {}".format(reason), "error")
             messagebox.showerror(
                 "Sensor Hub Fault",
-                "Sensor Hub is not responding.\n\n"
-                "Reason: {}\n\n"
+                "Sensor Hub is not responding.\n\nReason: {}\n\n"
                 "Check UART wiring and Hub power supply.".format(reason))
 
-        # ── Hub ready / sensor rejoin ─────────────────────────────────────────
         elif t == "hub_ready":
-            on       = msg.get("online_count",  0)
-            off      = msg.get("offline_count", 0)
-            fw       = msg.get("firmware_version", "?")
-            needs_p  = msg.get("needs_pairing", False)
-            self._lbl_fw.config(
-                text="Hub fw: {}".format(fw), fg=C_DIM)
+            on      = msg.get("online_count",  0)
+            off     = msg.get("offline_count", 0)
+            fw      = msg.get("firmware_version", "?")
+            needs_p = msg.get("needs_pairing", False)
+            self._lbl_fw.config(text="Hub fw: {}".format(fw), fg=C_DIM)
             colour = C_GREEN if on > 0 else C_YELLOW
             self._lbl_hub.config(
                 text="Hub: READY ({} online)".format(on), fg=colour)
@@ -1071,7 +951,6 @@ class DebuggerApp:
                 self._log_event(
                     "⚠  No sensors registered — open pairing to pair sensors",
                     "warn")
-            # Refresh sensor list after ready
             self.root.after(1000, lambda: self._tcp.send(
                 {"type": "get_sensor_config"}))
 
@@ -1101,7 +980,6 @@ class DebuggerApp:
             self._log_event(
                 "SENSOR LIST COMPLETE — total={} online={} offline={}".format(
                     total, online, offline), "hub")
-            # Refresh sensor table now that list is final
             self.root.after(500, lambda: self._tcp.send(
                 {"type": "get_sensor_config"}))
 
@@ -1125,7 +1003,6 @@ class DebuggerApp:
             self.root.after(500, lambda: self._tcp.send(
                 {"type": "get_sensor_config"}))
 
-        # ── Notification / alerts ─────────────────────────────────────────────
         elif t == "notification":
             level   = msg.get("level",   "info")
             message = msg.get("message", "")
@@ -1139,11 +1016,9 @@ class DebuggerApp:
                 prefix, message,
                 "  [{}]".format(sensor) if sensor else "")
             self._log_event(full, tag)
-            # Show popup for errors
             if level == "error":
                 messagebox.showerror("System Alert", message)
 
-        # ── Force commands ────────────────────────────────────────────────────
         elif t == "force_update":
             active  = msg.get("active", False)
             status  = msg.get("status", "")
@@ -1155,14 +1030,15 @@ class DebuggerApp:
                     "FORCE SET: {} — expires {} — {}".format(
                         status, expires, reason), "force")
             else:
-                self._log_event("FORCE CLEARED — automatic control resumed",
-                                "force")
+                self._log_event(
+                    "FORCE CLEARED — automatic control resumed", "force")
 
-        # ── Occupancy ─────────────────────────────────────────────────────────
         elif t == "unit_occupancy":
+            # ── RAW sensor state from the Hub ─────────────────────────────
+            # This is the ONLY place that should update the sensor label.
+            # It reflects actual sensor detection, not the booking decision.
             s = msg.get("state", "VACANT")
-            self._log_event(
-                "UNIT OCCUPANCY → {}".format(s), "unit")
+            self._log_event("UNIT OCCUPANCY → {}".format(s), "unit")
             occ_colour = C_GREEN if s.upper() == "OCCUPIED" else C_DIM
             self._lbl_sensor_occ.config(
                 text="Sensor: {}".format(s.upper()), fg=occ_colour)
@@ -1170,18 +1046,19 @@ class DebuggerApp:
                 text="Sensor: {}".format(s.upper()), fg=occ_colour)
 
         elif t == "unit_state_update":
+            # ── 4-state Master decision ───────────────────────────────────
+            # Updates the UNIT state label ONLY.
+            # Does NOT touch the Sensor label — that label shows raw sensor
+            # state from unit_occupancy above. The booking decision
+            # ("UnSold Occupied", "Sold Vacant" etc.) does not tell us
+            # whether the sensor currently detects someone — those are
+            # independent pieces of information.
             status = msg.get("status", "Unknown")
             colour = STATUS_COLOURS.get(status, C_DIM)
             self._lbl_unit_big.config(text=status, fg=colour)
             self._lbl_unit.config(text="Unit: {}".format(status), fg=colour)
             self._log_event("UNIT STATE → {}".format(status), "unit")
-            occ = "occupied" if status in ("Occupied", "UnSold Occupied") \
-                  else "vacant"
-            occ_colour = C_GREEN if occ == "occupied" else C_DIM
-            self._lbl_sensor_occ.config(
-                text="Sensor: {}".format(occ.upper()), fg=occ_colour)
-            self._lbl_occ.config(
-                text="Sensor: {}".format(occ.upper()), fg=occ_colour)
+            # NOTE: Sensor label intentionally NOT updated here.
 
         elif t == "pending_update":
             pending = msg.get("pending_status")
@@ -1193,7 +1070,6 @@ class DebuggerApp:
                 self._lbl_pending.config(text="")
                 self._lbl_pending2.config(text="")
 
-        # ── Sensor events ─────────────────────────────────────────────────────
         elif t == "sensor_presence":
             sensor = msg.get("sensor", "")
             sv     = msg.get("state", "")
@@ -1227,8 +1103,8 @@ class DebuggerApp:
             online = msg.get("state", "") == "ONLINE"
             sensor = msg.get("sensor", "")
             self._log_event(
-                "HEALTH  {}  {}".format(
-                    sensor, msg.get("state", "")), "health")
+                "HEALTH  {}  {}".format(sensor, msg.get("state", "")),
+                "health")
             self._update_sensor_health(sensor, online)
             if not online:
                 self._log_event(
@@ -1246,8 +1122,7 @@ class DebuggerApp:
         elif t == "heartbeat":
             fw = msg.get("firmware_version", "")
             if fw:
-                self._lbl_fw.config(
-                    text="Hub fw: {}".format(fw), fg=C_DIM)
+                self._lbl_fw.config(text="Hub fw: {}".format(fw), fg=C_DIM)
             self._log_event(
                 "HEARTBEAT  unit={}  fw={}".format(
                     msg.get("unit_state", ""), fw), "dim")
@@ -1259,7 +1134,8 @@ class DebuggerApp:
             self._apply_sensor_list(sensors)
             self._apply_hub_config_from_response(msg)
             self._log_event(
-                "SENSOR LIST updated — {} sensors".format(len(sensors)), "hub")
+                "SENSOR LIST updated — {} sensors".format(len(sensors)),
+                "hub")
 
         elif t == "scheduler_update":
             self._last_relay_time = time.monotonic()
@@ -1272,15 +1148,14 @@ class DebuggerApp:
             st  = msg.get("status", "?")
             self._log_event("ACK  {}  {}".format(cmd, st), "dim")
             if cmd in ("set_unit_config", "set_hub_config", "set_wifi_config"):
-                self._log_event(
-                    "Config saved ({})".format(cmd), "info")
+                self._log_event("Config saved ({})".format(cmd), "info")
             elif cmd == "start_watchdog":
                 self._log_event("Watchdog started ✓", "hub")
             elif cmd == "start_pairing":
                 self._log_event("Pairing window opened ✓", "hub")
             elif cmd == "cancel_force":
-                self._log_event("Force cancelled — automatic control active",
-                                "force")
+                self._log_event(
+                    "Force cancelled — automatic control active", "force")
 
         elif t == "log_response":
             self._log_hub(msg.get("line", ""))
@@ -1290,15 +1165,14 @@ class DebuggerApp:
     # -----------------------------------------------------------------------
 
     def _update_force_panel(self, active, status="", expires="", reason=""):
-        """Show or hide the force indicator panel."""
-        self._force_active  = active
-        self._force_status  = status
-        self._force_expires = expires
-        self._force_reason  = reason
+        self._force_active    = active
+        self._force_status_val = status
+        self._force_expires   = expires
+        self._force_reason    = reason
 
         if active:
             colour = STATUS_COLOURS.get(status, C_ORANGE)
-            self._lbl_force_status.config(
+            self._lbl_force_status_widget.config(
                 text="Status: {}".format(status), fg=colour)
             self._lbl_force_expires.config(
                 text="Expires: {} UTC".format(expires), fg=C_YELLOW)
@@ -1330,25 +1204,22 @@ class DebuggerApp:
         boot_ph   = snap.get("boot_phase",       "")
         mode      = snap.get("mode",             "production")
 
-        # Force fields
         force_active  = snap.get("force_active",  False)
         force_status  = snap.get("force_status",  "")
         force_expires = snap.get("force_expires_utc", "")
         force_reason  = snap.get("force_reason",  "")
 
-        # Unit state label
         colour = STATUS_COLOURS.get(unit, C_DIM)
         self._lbl_unit_big.config(text=unit, fg=colour)
         self._lbl_unit.config(text="Unit: {}".format(unit), fg=colour)
 
-        # Sensor occupancy
+        # Sensor occupancy from snapshot — raw sensor state
         occ_colour = C_GREEN if sensor == "occupied" else C_DIM
         self._lbl_sensor_occ.config(
             text="Sensor: {}".format(sensor.upper()), fg=occ_colour)
         self._lbl_occ.config(
             text="Sensor: {}".format(sensor.upper()), fg=occ_colour)
 
-        # Internet / NTP
         self._update_internet_indicator(inet_up)
         if ntp_ok:
             self._lbl_ntp.config(text="NTP: ✓", fg=C_GREEN)
@@ -1360,7 +1231,6 @@ class DebuggerApp:
             self._lbl_utc.config(text="UTC: not synced", fg=C_RED)
             self._lbl_utc_big.config(text="UTC: not synced", fg=C_RED)
 
-        # Hub state
         if hub_fault:
             self._lbl_hub.config(text="Hub: FAULT", fg=C_RED)
         elif hub_state == "READY":
@@ -1372,7 +1242,6 @@ class DebuggerApp:
         else:
             self._lbl_hub.config(text="Hub: UNKNOWN", fg=C_DIM)
 
-        # Firmware version
         fw_parts = []
         if master_fw: fw_parts.append("Master v{}".format(master_fw))
         if hub_fw:    fw_parts.append("Hub v{}".format(hub_fw))
@@ -1380,14 +1249,12 @@ class DebuggerApp:
             text="  ".join(fw_parts) if fw_parts else "fw: —",
             fg=C_DIM)
 
-        # Boot phase (clear if READY)
         if boot_ph and boot_ph != "READY":
             self._lbl_boot_phase.config(
                 text="Phase: {}".format(boot_ph), fg=C_YELLOW)
         else:
             self._lbl_boot_phase.config(text="")
 
-        # Pending
         if pending:
             txt = "⏳ Pending: {}".format(pending)
             self._lbl_pending.config(text=txt)
@@ -1396,11 +1263,9 @@ class DebuggerApp:
             self._lbl_pending.config(text="")
             self._lbl_pending2.config(text="")
 
-        # IP
         self._lbl_ip.config(
             text="IP: {}".format(ip) if ip else "IP: —")
 
-        # Mode indicator
         if mode == "debug":
             self._lbl_inet_mode.config(
                 text="Mode: DEBUG (MQTT paused)", fg=C_ORANGE)
@@ -1412,15 +1277,12 @@ class DebuggerApp:
                 text="Mode: 2-state fallback (Occupied/Vacant only)",
                 fg=C_YELLOW)
 
-        # Force indicator — restore on reconnect
         self._update_force_panel(
             force_active, force_status, force_expires, force_reason)
 
-        # Scheduler
         if sched:
             self._apply_relay_snapshot({}, sched)
 
-        # Config tab entries
         for key, entry in self._cfg_entries.items():
             if key == "wifi_password":
                 continue
@@ -1445,7 +1307,6 @@ class DebuggerApp:
             "dim")
 
     def _apply_hub_config_from_response(self, msg):
-        """Populate hub config entries from config_response (not snapshot)."""
         for key, entry in self._hub_entries.items():
             val = msg.get(key, "")
             if val is None: val = ""
@@ -1465,7 +1326,6 @@ class DebuggerApp:
                 fg=C_YELLOW)
 
     def _apply_sensor_list(self, sensors):
-        # Snapshot live state before rebuild
         live = {}
         for iid in self._sensor_tree.get_children():
             vals = self._sensor_tree.item(iid, "values")
@@ -1605,9 +1465,8 @@ class DebuggerApp:
     def _log_raw(self, msg):
         t = msg.get("type", "")
         if t in ("state_snapshot", "pong", "scheduler_update",
-                 "pending_update", "unit_state_update",
-                 "boot_phase"):
-            return   # suppress high-frequency noise from raw log
+                 "pending_update", "unit_state_update", "boot_phase"):
+            return
         self._log("← RX  {}".format(json.dumps(msg)[:160]), "rx")
 
     def _log_hub(self, line):
@@ -1635,14 +1494,15 @@ class DebuggerApp:
         self._tcp.send({"type": "ntp_sync"})
         self._log("TX → ntp_sync", "tx")
 
-    def _force_status(self, status):
+    def _do_force_status(self, status):
         """
-        Open force duration dialog. Sends force_status with duration_hours.
-        Minimum 1 hour. Maximum 24 hours.
+        Opens ForceDurationDialog, then sends force_status command.
+        Named _do_force_status to avoid any name collision with instance
+        variables that store force state information.
         """
         dlg = ForceDurationDialog(self.root, status)
         if dlg.result_hours is None:
-            return   # cancelled
+            return
         payload = {
             "type":           "force_status",
             "status":         status,
@@ -1676,7 +1536,6 @@ class DebuggerApp:
         self._log("TX → stop_pairing", "tx")
 
     def _start_watchdog(self):
-        """Manually send start_watchdog — useful after pairing new sensors."""
         self._tcp.send({"type": "start_watchdog"})
         self._log("TX → start_watchdog", "tx")
 
@@ -1712,8 +1571,7 @@ class DebuggerApp:
     def _restart_master(self):
         if messagebox.askyesno(
             "Restart Master",
-            "Restart the Master ESP32-S3?\n\n"
-            "Boot sequence will re-run."
+            "Restart the Master ESP32-S3?\n\nBoot sequence will re-run."
         ):
             self._tcp.send({"type": "master_restart"})
             self._log("TX → master_restart", "tx")
@@ -1730,8 +1588,7 @@ class DebuggerApp:
     def _scheduler_factory_reset(self):
         if messagebox.askyesno(
             "Scheduler Factory Reset",
-            "⚠  Factory reset the Scheduler?\n\n"
-            "All relay schedules will be erased.",
+            "⚠  Factory reset the Scheduler?\n\nAll relay schedules will be erased.",
             icon="warning"
         ):
             self._tcp.send({"type": "scheduler_factory_reset"})
