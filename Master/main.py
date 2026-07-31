@@ -44,6 +44,12 @@
 #   - buffer cancellation always sends unit_state_update (force_send)
 #   - Debugger connect/disconnect switches mode at runtime
 #   - firmware_version in state snapshot and hub_init
+#
+# FIX: UART_RX_BUF_MAX increased from 512 to 1024.
+#   config_response with 3 sensors exceeds 512 bytes.
+#   With 512: "WARN: RX buf overflow" then "WARN: RX non-JSON 0x65"
+#   (0x65 = 'e', the truncated remainder of the JSON starting mid-field).
+#   1024 bytes matches the Hub TX message size and fits all 15 sensors.
 
 import utime
 import ujson as json
@@ -57,7 +63,7 @@ import master_config as cfg
 # CONSTANTS
 # ============================================================================
 
-UART_RX_BUF_MAX             = 512
+UART_RX_BUF_MAX             = 1024  # was 512 — increased to fit config_response with 3+ sensors
 MAIN_LOOP_TICK_MS           = 1000
 TCP_PORT                    = 8765
 TCP_RX_BUF_MAX              = 1024
