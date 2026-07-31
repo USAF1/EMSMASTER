@@ -2,54 +2,44 @@
 # Innovatsii EMS — Pico 1
 # Firmware Version: 0.2.5
 #
-# UART1 <-> Sensor Hub  (TX=GPIO16, RX=GPIO17) at 9600 baud
-# UART2 <-> Scheduler   — NOT INITIALISED (Phase 4)
-# TCP   <-> Debugger App (port 8765)
+# ARCHITECTURE — V4.2+ (Hub sends raw events, Master calculates unit occupancy)
 #
-# Boot sequence (v0.2.5):
-#   Master is the active boot controller. Hub is passive.
+# Hub responsibility:
+#   - Reports sensor_presence, door, battery, environment, sensor_health
+#   - Reports hub_aggregate (OR of all online presence sensors — no door logic)
+#   - Sends real UTC timestamps on all messages (from utc_epoch in hub_init)
 #
-#   PHASE A — Hub Discovery:
-#     Send {"type":"ping"} every 2 seconds, up to 10 attempts.
-#     Hub responds with {"type":"pong"}.
-#     No response after 10 attempts → hub_status.fault=true, halt.
+# Master responsibility:
+#   - Tracks latest state of each presence sensor and door sensor with timestamp
+#   - Calculates unit occupancy: door close + presence evaluation
+#   - Applies booking window → 4-state decision
+#   - Applies buffer period (buffer_minutes)
+#   - Sends set_status to Scheduler
 #
-#   PHASE B — Hub Init:
-#     Send hub_init with full config.
-#     Hub ACKs, starts Zigbee, forms network, sends hub_ready.
+# Unit occupancy rules (Master):
+#   VACANT → OCCUPIED:
+#     Door CLOSED transition AND any presence sensor YES
+#     (within DOOR_PENDING_WINDOW_SEC of door close)
+#   OCCUPIED → VACANT:
+#     Door CLOSED transition AND all presence sensors NO
+#     (within DOOR_PENDING_WINDOW_SEC of door close)
+#   Presence change alone:
+#     Updates _presence dict
+#     Re-evaluates if a door was recently closed (within window)
+#     Does NOT change unit state alone — door event always required
 #
-#   PHASE C — Sensor Rejoin:
-#     Hub sends sensor_joined or sensor_status for each sensor.
-#     Hub sends sensor_list_complete when done.
+# Debugger display:
+#   Orange box (Unit Occupancy State / big label) = Master 4-state decision
+#   Red box   (Sensor: label)                    = Hub aggregate (presence OR)
 #
-#   PHASE D — Watchdog Start:
-#     Master sends start_watchdog.
-#     Hub ACKs, starts watchdog and data flow.
-#
-#   PHASE E — Pairing (operator triggered only):
-#     hub_ready with needs_pairing=true → alert Debugger.
-#     Pairing NEVER opens automatically.
-#
-# Changes in v0.2.5 vs previous:
-#   - New boot protocol (ping/pong/hub_init/start_watchdog)
-#   - hub_boot spontaneous handling removed
-#   - sensor_joined, sensor_status, sensor_list_complete handlers added
-#   - new_sensor_joined, pairing_complete handlers added
-#   - Force command system (force_status, cancel_force, force expiry)
-#   - Production/Debug mode — MQTT paused when debugger connected
-#   - hub_status object tracked in config
-#   - presence_fading_time_sec, door_sensor_max_silence_hours in hub_init
-#   - recalc_and_act blocked during active force
-#   - pending_worker checks force expiry every second
-#   - buffer cancellation always sends unit_state_update (force_send)
-#   - Debugger connect/disconnect switches mode at runtime
-#   - firmware_version in state snapshot and hub_init
-#
-# FIX: UART_RX_BUF_MAX increased from 512 to 1024.
-#   config_response with 3 sensors exceeds 512 bytes.
-#   With 512: "WARN: RX buf overflow" then "WARN: RX non-JSON 0x65"
-#   (0x65 = 'e', the truncated remainder of the JSON starting mid-field).
-#   1024 bytes matches the Hub TX message size and fits all 15 sensors.
+# Changes from previous main.py:
+#   - UART_RX_BUF_MAX increased 512 → 1024
+#   - hub_init includes utc_epoch (Master's current epoch)
+#   - hub_aggregate handler added (replaces unit_occupancy from Hub)
+#   - unit_occupancy handler removed (Hub no longer sends this)
+#   - Master unit occupancy engine: _presence, _door dicts + evaluate functions
+#   - state_snapshot includes hub_aggregate field
+#   - sensor_presence handler updates _presence and may re-evaluate
 
 import utime
 import ujson as json
@@ -63,20 +53,23 @@ import master_config as cfg
 # CONSTANTS
 # ============================================================================
 
-UART_RX_BUF_MAX             = 1024  # was 512 — increased to fit config_response with 3+ sensors
-MAIN_LOOP_TICK_MS           = 1000
-TCP_PORT                    = 8765
-TCP_RX_BUF_MAX              = 1024
-INTERNET_CHECK_HOST         = "8.8.8.8"
-INTERNET_CHECK_PORT         = 53
-INTERNET_CHECK_TIMEOUT_S    = 3
-INTERNET_RECHECK_S          = 60
-NTP_SYNC_INTERVAL_S         = 3600
-HUB_PING_ATTEMPTS           = 10
-HUB_PING_INTERVAL_MS        = 2000
-HUB_INIT_ACK_TIMEOUT_MS     = 5000
-HUB_READY_TIMEOUT_MS        = 120000   # 2 minutes for network formation
-WATCHDOG_ACK_TIMEOUT_MS     = 5000
+UART_RX_BUF_MAX          = 1024  # increased from 512 — config_response with 3+ sensors
+MAIN_LOOP_TICK_MS        = 1000
+TCP_PORT                 = 8765
+TCP_RX_BUF_MAX           = 1024
+INTERNET_CHECK_HOST      = "8.8.8.8"
+INTERNET_CHECK_PORT      = 53
+INTERNET_CHECK_TIMEOUT_S = 3
+INTERNET_RECHECK_S       = 60
+NTP_SYNC_INTERVAL_S      = 3600
+HUB_PING_ATTEMPTS        = 10
+HUB_PING_INTERVAL_MS     = 2000
+HUB_INIT_ACK_TIMEOUT_MS  = 5000
+HUB_READY_TIMEOUT_MS     = 120000
+WATCHDOG_ACK_TIMEOUT_MS  = 5000
+
+# How long after a door close to accept presence events for re-evaluation
+DOOR_PENDING_WINDOW_SEC  = 30
 
 # ============================================================================
 # UART INITIALISATION
@@ -89,13 +82,11 @@ uart_sensor = UART(cfg.SENSOR_UART_ID,
 
 uart_sched = None
 
-# Pre-allocated static receive buffers
 _rx_sensor_buf = bytearray(UART_RX_BUF_MAX)
 _rx_sched_buf  = bytearray(UART_RX_BUF_MAX)
 _rx_sensor_pos = 0
 _rx_sched_pos  = 0
 
-# Pre-allocated static TCP receive buffer (module level — not in thread)
 _rx_tcp_buf = bytearray(TCP_RX_BUF_MAX)
 
 # ============================================================================
@@ -121,7 +112,7 @@ state = {
 
 _internet_up          = False
 _wifi_ip              = ""
-_hub_state            = "UNKNOWN"   # UNKNOWN / BOOTING / READY / FAULT
+_hub_state            = "UNKNOWN"
 _tcp_client           = None
 _mac_str              = ""
 _ntp_synced           = False
@@ -130,16 +121,89 @@ _hub_config_push_in_progress = False
 _tcp_server_started          = False
 
 # Boot phase tracking
-_hub_pong_received        = False
-_hub_init_acked           = False
-_hub_ready_received       = False
-_sensor_list_complete     = False
-_watchdog_start_acked     = False
-_boot_phase               = "IDLE"   # IDLE/PING/INIT/REJOIN/WATCHDOG/READY/FAULT
+_hub_pong_received    = False
+_hub_init_acked       = False
+_hub_ready_received   = False
+_sensor_list_complete = False
+_watchdog_start_acked = False
+_boot_phase           = "IDLE"
 
-# Debug/Production mode
-# True when a debugger TCP client is connected
 _debug_mode = False
+
+# ============================================================================
+# MASTER UNIT OCCUPANCY ENGINE
+#
+# Hub sends raw sensor events. Master tracks state and evaluates.
+#
+# _presence: {"Sensor_1": {"state": True,  "ts": "2026-07-31 13:00:00"}}
+# _door:     {"Sensor_2": {"state": "CLOSED", "ts": "...", "closed_at": epoch}}
+# _hub_aggregate: "occupied" or "vacant" — raw Hub presence OR
+# ============================================================================
+
+_presence      = {}   # per presence sensor: state + timestamp
+_door          = {}   # per door sensor: state + timestamp + closed_at
+_hub_aggregate = "vacant"
+
+def _utc_now_str():
+    t = utime.localtime()
+    return "{}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
+        t[0], t[1], t[2], t[3], t[4], t[5])
+
+def _evaluate_unit_occupancy_on_door_close():
+    """
+    Called when a door closes. Evaluates presence sensors to determine
+    whether unit should transition to OCCUPIED or VACANT.
+    Called with _state_lock NOT held — acquires it internally.
+    """
+    if _force_active():
+        return
+
+    any_yes = any(v.get("state", False) for v in _presence.values())
+    all_no  = not any_yes
+    has_presence_sensors = len(_presence) > 0
+
+    if not has_presence_sensors:
+        return  # no presence sensors online — cannot evaluate
+
+    current = state["last_sensor_status"]
+
+    new_status = None
+    if current == "vacant" and any_yes:
+        new_status = "occupied"
+        print("UNIT EVAL: door closed + presence YES → OCCUPIED")
+    elif current == "occupied" and all_no:
+        new_status = "vacant"
+        print("UNIT EVAL: door closed + all NO → VACANT")
+    else:
+        print("UNIT EVAL: door closed, no change (current={} any_yes={} all_no={})".format(
+              current, any_yes, all_no))
+
+    if new_status and new_status != current:
+        with _state_lock:
+            state["last_sensor_status"] = new_status
+            conf["last_sensor_status"]  = new_status
+            save_config()
+            recalc_and_act()
+
+def _maybe_evaluate_on_presence_change():
+    """
+    Called when a presence sensor state changes.
+    Only re-evaluates if a door was recently closed (within DOOR_PENDING_WINDOW_SEC).
+    This handles the fading time race — presence goes NO slightly after door close.
+    """
+    if _force_active():
+        return
+
+    now = utime.time()
+    door_recently_closed = False
+    for sensor_name, d in _door.items():
+        closed_at = d.get("closed_at", 0)
+        if closed_at > 0 and (now - closed_at) <= DOOR_PENDING_WINDOW_SEC:
+            door_recently_closed = True
+            break
+
+    if door_recently_closed:
+        _evaluate_unit_occupancy_on_door_close()
 
 # ============================================================================
 # PERSISTENT CONFIG
@@ -305,7 +369,6 @@ def decide_status(sensor_status, now_ep):
 # ============================================================================
 
 def _force_active():
-    """Returns True if a force is currently active and not expired."""
     f = conf.get("force", {})
     if not f.get("active", False):
         return False
@@ -316,7 +379,6 @@ def _force_active():
 
 
 def _apply_force(status, duration_hours, reason="Manual force"):
-    """Set a force. Replaces any existing force immediately."""
     now_ep      = now_epoch_utc()
     expires_ep  = now_ep + duration_hours * 3600
     expires_str = epoch_to_utc_str(expires_ep)
@@ -339,19 +401,18 @@ def _apply_force(status, duration_hours, reason="Manual force"):
     send_status_to_scheduler(status)
     tcp_forward({"type": "unit_state_update", "status": status})
     tcp_forward({
-        "type":        "force_update",
-        "active":      True,
-        "status":      status,
-        "expires_utc": expires_str,
+        "type":          "force_update",
+        "active":        True,
+        "status":        status,
+        "expires_utc":   expires_str,
         "expires_epoch": expires_ep,
-        "reason":      conf["force"]["reason"]
+        "reason":        conf["force"]["reason"]
     })
     print("FORCE SET: status={} duration={}h expires={}".format(
           status, duration_hours, expires_str))
 
 
 def _clear_force(recalculate=True):
-    """Clear an active force. Optionally recalculate state."""
     conf["force"] = {
         "active":        False,
         "status":        "",
@@ -360,10 +421,7 @@ def _clear_force(recalculate=True):
         "reason":        ""
     }
     save_config()
-    tcp_forward({
-        "type":   "force_update",
-        "active": False
-    })
+    tcp_forward({"type": "force_update", "active": False})
     print("FORCE CLEARED")
     if recalculate:
         with _state_lock:
@@ -408,10 +466,7 @@ def schedule_buffered(status, now_ep):
 
 
 def recalc_and_act():
-    """
-    Called ONLY when _state_lock is already held by the caller.
-    Skipped if force is active — force overrides all automatic logic.
-    """
+    """Called ONLY when _state_lock is already held."""
     if _force_active():
         print("RECALC skipped — force active")
         return
@@ -448,6 +503,7 @@ def build_state_snapshot():
             "firmware_version":     cfg.FIRMWARE_VERSION,
             "unit_state":           state["current_decided_status"] or "Unknown",
             "sensor_occupancy":     state["last_sensor_status"],
+            "hub_aggregate":        _hub_aggregate,     # raw Hub presence OR
             "pending_status":       state["pending_status"],
             "pending_apply_epoch":  state["pending_apply_epoch"],
             "force_active":         force.get("active",        False),
@@ -481,60 +537,49 @@ def build_state_snapshot():
 # ============================================================================
 
 def _build_hub_init():
-    """Build the hub_init command dict from current config."""
     hub_cfg = conf.get("sensor_hub_config", {})
     return {
         "type":                          "hub_init",
         "mode":                          "debug" if _debug_mode else "production",
         "firmware_version":              cfg.FIRMWARE_VERSION,
+        "utc_epoch":                     now_epoch_utc(),   # Hub uses this for real UTC timestamps
         "pairing_duration_sec":          hub_cfg.get("pairing_duration_sec",          120),
         "watchdog_enable":               hub_cfg.get("watchdog_enable",                True),
         "watchdog_interval_min":         hub_cfg.get("watchdog_interval_min",          60),
         "watchdog_ping_timeout_sec":     hub_cfg.get("watchdog_ping_timeout_sec",      30),
         "door_alarm_threshold_min":      hub_cfg.get("door_alarm_threshold_min",       10),
         "heartbeat_interval_min":        hub_cfg.get("heartbeat_interval_min",         30),
-        "presence_fading_time_sec":      hub_cfg.get("presence_fading_time_sec",       30),
+        "presence_fading_time_sec":      hub_cfg.get("presence_fading_time_sec",       0),
         "door_sensor_max_silence_hours": hub_cfg.get("door_sensor_max_silence_hours",  24),
     }
 
 
 # ============================================================================
-# BOOT CONTROLLER — Phases A through D run in a background thread
+# BOOT CONTROLLER
 # ============================================================================
 
 def _boot_controller_thread():
-    """
-    Runs as a background thread immediately on boot.
-    Executes the full boot sequence:
-      Phase A — Hub discovery (ping/pong)
-      Phase B — Hub init (hub_init / ACK / hub_ready)
-      Phase C — Sensor rejoin (sensor_joined/sensor_status/sensor_list_complete)
-      Phase D — Watchdog start
-    """
     global _hub_state, _boot_phase
     global _hub_pong_received, _hub_init_acked
     global _hub_ready_received, _sensor_list_complete, _watchdog_start_acked
 
-    utime.sleep_ms(500)   # brief delay for UART to settle
+    utime.sleep_ms(500)
 
     # ── PHASE A — Hub Discovery ──────────────────────────────────────────────
     _boot_phase = "PING"
-    print("BOOT [A] Hub discovery — ping up to {} times".format(
-          HUB_PING_ATTEMPTS))
+    print("BOOT [A] Hub discovery — ping up to {} times".format(HUB_PING_ATTEMPTS))
     tcp_forward({"type": "boot_phase", "phase": "A_PING"})
 
     pong_received = False
     for attempt in range(1, HUB_PING_ATTEMPTS + 1):
         send_to_sensor_hub({"type": "ping"})
         print("BOOT [A] ping attempt {}/{}".format(attempt, HUB_PING_ATTEMPTS))
-
         deadline = utime.ticks_add(utime.ticks_ms(), HUB_PING_INTERVAL_MS)
         while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
             if _hub_pong_received:
                 pong_received = True
                 break
             utime.sleep_ms(100)
-
         if pong_received:
             print("BOOT [A] pong received on attempt {}".format(attempt))
             break
@@ -545,14 +590,13 @@ def _boot_controller_thread():
         conf["hub_status"]["fault"]        = True
         conf["hub_status"]["fault_reason"] = "no_response_to_ping"
         save_config()
-        msg = "Hub not responding after {} attempts — check UART wiring".format(
-              HUB_PING_ATTEMPTS)
+        msg = "Hub not responding after {} attempts — check UART wiring".format(HUB_PING_ATTEMPTS)
         print("BOOT [A] FAULT:", msg)
         tcp_forward({"type": "boot_fault", "reason": msg})
         return
 
-    conf["hub_status"]["fault"]  = False
-    conf["hub_status"]["known"]  = True
+    conf["hub_status"]["fault"] = False
+    conf["hub_status"]["known"] = True
     save_config()
     tcp_forward({"type": "boot_phase", "phase": "A_DONE"})
 
@@ -563,20 +607,17 @@ def _boot_controller_thread():
     tcp_forward({"type": "boot_phase", "phase": "B_INIT"})
 
     init_acked = False
-    for init_attempt in range(1, 3):   # 2 attempts
+    for init_attempt in range(1, 3):
         _hub_init_acked = False
         send_to_sensor_hub(_build_hub_init())
-
         deadline = utime.ticks_add(utime.ticks_ms(), HUB_INIT_ACK_TIMEOUT_MS)
         while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
             if _hub_init_acked:
                 init_acked = True
                 break
             utime.sleep_ms(100)
-
         if init_acked:
-            print("BOOT [B] hub_init ACK received (attempt {})".format(
-                  init_attempt))
+            print("BOOT [B] hub_init ACK received (attempt {})".format(init_attempt))
             break
         print("BOOT [B] hub_init no ACK (attempt {}/2)".format(init_attempt))
 
@@ -591,7 +632,6 @@ def _boot_controller_thread():
         tcp_forward({"type": "boot_fault", "reason": msg})
         return
 
-    # Wait for hub_ready (network formation can take up to 60s)
     print("BOOT [B] Waiting for hub_ready (network formation)...")
     _hub_ready_received = False
     deadline = utime.ticks_add(utime.ticks_ms(), HUB_READY_TIMEOUT_MS)
@@ -606,8 +646,7 @@ def _boot_controller_thread():
         conf["hub_status"]["fault"]        = True
         conf["hub_status"]["fault_reason"] = "hub_ready_timeout"
         save_config()
-        msg = "Hub did not send hub_ready within {}s".format(
-              HUB_READY_TIMEOUT_MS // 1000)
+        msg = "Hub did not send hub_ready within {}s".format(HUB_READY_TIMEOUT_MS // 1000)
         print("BOOT [B] FAULT:", msg)
         tcp_forward({"type": "boot_fault", "reason": msg})
         return
@@ -619,18 +658,14 @@ def _boot_controller_thread():
     print("BOOT [C] Waiting for sensor rejoin to complete...")
     tcp_forward({"type": "boot_phase", "phase": "C_REJOIN"})
 
-    # sensor_list_complete sets _sensor_list_complete flag in its handler.
-    # Maximum wait: 6 retries × 10s × 15 sensors = 900s worst case.
-    # In practice 3 sensors × 6 × 10s = 180s maximum.
     _sensor_list_complete = False
-    deadline = utime.ticks_add(utime.ticks_ms(), 240000)  # 4 minute cap
+    deadline = utime.ticks_add(utime.ticks_ms(), 240000)
     while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
         if _sensor_list_complete:
             break
         utime.sleep_ms(500)
 
     if not _sensor_list_complete:
-        # Proceed anyway — sensors may still be joining
         print("BOOT [C] sensor_list_complete not received within cap — proceeding")
     else:
         print("BOOT [C] Sensor rejoin phase complete")
@@ -666,9 +701,7 @@ def _boot_controller_thread():
     tcp_forward({"type": "boot_phase", "phase": "READY"})
     tcp_forward(build_state_snapshot())
 
-    # Calculate initial unit state
     with _state_lock:
-        # Check if force survived reboot and is still valid
         if _force_active():
             f = conf.get("force", {})
             print("FORCE restored from config: status={} expires={}".format(
@@ -683,7 +716,6 @@ def _boot_controller_thread():
                          "reason":        f.get("reason", "")})
         else:
             if _force_active() is False and conf.get("force", {}).get("active"):
-                # Force was active but expired while Master was down
                 print("BOOT: force expired during reboot — clearing")
                 _clear_force(recalculate=False)
             recalc_and_act()
@@ -716,25 +748,20 @@ def _handle_hub_ready(msg):
     if not isinstance(online,        int):  online        = 0
     if not isinstance(offline,       int):  offline       = 0
     if not isinstance(needs_pairing, bool): needs_pairing = False
-    print("HUB READY: v={} sensors={} online={} offline={} "
-          "needs_pairing={} unit={}".format(
-          fw, sensor_count, online, offline, needs_pairing,
-          msg.get("unit_state", "?")))
-    conf["hub_status"]["sensor_count"]    = sensor_count
+    print("HUB READY: v={} sensors={} online={} offline={} needs_pairing={}".format(
+          fw, sensor_count, online, offline, needs_pairing))
+    conf["hub_status"]["sensor_count"]     = sensor_count
     conf["hub_status"]["firmware_version"] = fw
     save_config()
     tcp_forward(msg)
     if needs_pairing:
-        print("HUB READY: no sensors registered — "
-              "open pairing from Debugger or MQTT")
+        print("HUB READY: no sensors — open pairing from Debugger or MQTT")
         tcp_forward({"type": "notification",
                      "level":   "info",
-                     "message": "No sensors registered — "
-                                "open pairing to add sensors"})
+                     "message": "No sensors registered — open pairing to add sensors"})
 
 
 def _handle_sensor_joined(msg):
-    """Individual sensor rejoined successfully at boot."""
     idx     = msg.get("index",  -1)
     name    = msg.get("name",   "?")
     model   = msg.get("model",  "?")
@@ -743,7 +770,6 @@ def _handle_sensor_joined(msg):
     battery = msg.get("battery", 0)
     print("SENSOR JOINED: [{}] {} {} {} online={} batt={}%".format(
           idx, name, model, role, online, battery))
-    # Update sensor_names cache in config
     hub_cfg = conf.get("sensor_hub_config", {})
     names   = hub_cfg.get("sensor_names", {})
     if isinstance(idx, int) and idx >= 0 and isinstance(name, str):
@@ -754,7 +780,6 @@ def _handle_sensor_joined(msg):
 
 
 def _handle_sensor_status(msg):
-    """Individual sensor failed to rejoin at boot."""
     idx    = msg.get("index",  -1)
     name   = msg.get("name",   "?")
     online = msg.get("online", False)
@@ -776,7 +801,6 @@ def _handle_sensor_list_complete(msg):
 
 
 def _handle_new_sensor_joined(msg):
-    """New sensor joined during pairing window."""
     idx   = msg.get("index",  -1)
     name  = msg.get("name",   "Sensor_{}".format(idx + 1))
     model = msg.get("model",  "?")
@@ -802,41 +826,48 @@ def _handle_pairing_complete(msg):
     tcp_forward(build_state_snapshot())
 
 
-def _handle_unit_occupancy(msg):
-    raw = msg.get("state", "")
+def _handle_hub_aggregate(msg):
+    """
+    Hub aggregate = OR of all online presence sensors.
+    No door logic — pure presence truth from the Hub.
+    Updates the red box (Sensor: label) in the Debugger.
+    Does NOT directly change unit state — Master's occupancy engine does that.
+    """
+    global _hub_aggregate
+    raw = msg.get("state", "VACANT")
     if not isinstance(raw, str):
-        print("WARN unit_occupancy: invalid state field")
         return
-    sensor_status = "occupied" if raw.strip().upper() == "OCCUPIED" else "vacant"
-
-    # Always store the sensor status even during force
-    with _state_lock:
-        state["last_sensor_status"] = sensor_status
-        conf["last_sensor_status"]  = sensor_status
-        save_config()
-
-    # If force is active, do NOT act on this — just log and forward
-    if _force_active():
-        print("UNIT OCCUPANCY: sensor={} — FORCE ACTIVE, not acting".format(
-              sensor_status))
-        tcp_forward(msg)
-        return
-
-    with _state_lock:
-        print("UNIT OCCUPANCY: sensor={} ntp={}".format(
-              sensor_status, _ntp_synced))
-        recalc_and_act()
+    _hub_aggregate = raw.strip().upper()
+    print("HUB AGGREGATE: {}".format(_hub_aggregate))
+    # Forward to Debugger — updates the "Sensor:" label (red box in image 4)
     tcp_forward(msg)
+    # Also send as sensor_occupancy update so Debugger label stays in sync
+    occ_lower = "occupied" if _hub_aggregate == "OCCUPIED" else "vacant"
+    tcp_forward({"type": "hub_aggregate_update", "state": occ_lower})
 
 
 def _handle_sensor_presence(msg):
-    sensor    = msg.get("sensor", "?")
-    state_val = msg.get("state", "?")
+    """
+    Updates local _presence dict and may re-evaluate unit occupancy.
+    Presence change alone does NOT change unit state unless a door
+    was recently closed (within DOOR_PENDING_WINDOW_SEC).
+    """
+    sensor    = msg.get("sensor", "")
+    state_val = msg.get("state", "NO")
+    ts        = msg.get("ts_utc", _utc_now_str())
+
     if not isinstance(sensor, str) or not isinstance(state_val, str):
         print("WARN sensor_presence: invalid fields")
         return
+
+    is_yes = (state_val.strip().upper() == "YES")
+    _presence[sensor] = {"state": is_yes, "ts": ts}
+
     print("PRESENCE: {} {}".format(sensor, state_val))
     tcp_forward(msg)
+
+    # Re-evaluate if door was recently closed (handles fading race condition)
+    _maybe_evaluate_on_presence_change()
 
 
 def _handle_environment(msg):
@@ -852,13 +883,43 @@ def _handle_environment(msg):
 
 
 def _handle_door(msg):
-    sensor    = msg.get("sensor", "?")
-    state_val = msg.get("state", "?")
+    """
+    Updates local _door dict and evaluates unit occupancy on CLOSE transition.
+    This is the primary occupancy trigger — CLOSED + sensors decide direction.
+    """
+    sensor    = msg.get("sensor", "")
+    state_val = msg.get("state", "")
+    ts        = msg.get("ts_utc", _utc_now_str())
+
     if not isinstance(sensor, str) or not isinstance(state_val, str):
         print("WARN door: invalid fields")
         return
+
+    was       = _door.get(sensor, {}).get("state", "")
+    now_epoch = utime.time()
+
+    if state_val == "OPEN":
+        _door[sensor] = {
+            "state":     "OPEN",
+            "ts":        ts,
+            "opened_at": now_epoch,
+            "closed_at": _door.get(sensor, {}).get("closed_at", 0)
+        }
+    else:  # CLOSED
+        _door[sensor] = {
+            "state":     "CLOSED",
+            "ts":        ts,
+            "opened_at": _door.get(sensor, {}).get("opened_at", 0),
+            "closed_at": now_epoch
+        }
+
     print("DOOR: {} {}".format(sensor, state_val))
     tcp_forward(msg)
+
+    # Evaluate unit occupancy only on OPEN→CLOSED transition
+    if state_val == "CLOSED" and was == "OPEN":
+        print("DOOR CLOSED transition — evaluating unit occupancy")
+        _evaluate_unit_occupancy_on_door_close()
 
 
 def _handle_door_alarm(msg):
@@ -876,8 +937,11 @@ def _handle_sensor_health(msg):
         print("WARN sensor_health: invalid fields")
         return
     print("SENSOR HEALTH: {} {}".format(sensor, state_val))
-    # Presence sensor offline — forward as alert
     if state_val.upper() == "OFFLINE":
+        # Remove from _presence so offline sensor does not block VACANT evaluation
+        if sensor in _presence:
+            del _presence[sensor]
+            print("PRESENCE dict: removed {} (OFFLINE)".format(sensor))
         tcp_forward({"type":    "notification",
                      "level":   "warning",
                      "sensor":  sensor,
@@ -895,10 +959,27 @@ def _handle_battery(msg):
 
 
 def _handle_heartbeat(msg):
-    unit = msg.get("unit_state", "?")
-    fw   = msg.get("firmware_version", "?")
-    if not isinstance(unit, str): return
-    print("HEARTBEAT: unit={} fw={}".format(unit, fw))
+    agg = msg.get("hub_aggregate", "")
+    fw  = msg.get("firmware_version", "?")
+    print("HEARTBEAT: hub_aggregate={} fw={}".format(agg, fw))
+    # Update presence dict from heartbeat sensor list
+    for s in msg.get("sensors", []):
+        if not isinstance(s, dict): continue
+        role = s.get("role", "")
+        name = s.get("name", "")
+        ts   = msg.get("ts_utc", _utc_now_str())
+        if role == "PRESENCE" and name:
+            pres = s.get("presence", False)
+            if isinstance(pres, bool):
+                _presence[name] = {"state": pres, "ts": ts}
+        elif role == "DOOR" and name:
+            contact = s.get("contact", "CLOSED")
+            if name not in _door:
+                _door[name] = {"state": contact, "ts": ts,
+                               "opened_at": 0, "closed_at": 0}
+            else:
+                _door[name]["state"] = contact
+                _door[name]["ts"]    = ts
     tcp_forward(msg)
 
 
@@ -944,16 +1025,6 @@ def _handle_log_response(msg):
     tcp_forward(msg)
 
 
-def _handle_boot_fault_internal(reason):
-    """Called when boot controller detects a fault."""
-    global _hub_state, _boot_phase
-    _hub_state  = "FAULT"
-    _boot_phase = "FAULT"
-    tcp_forward({"type":    "notification",
-                 "level":   "error",
-                 "message": "Sensor Hub fault: {}".format(reason)})
-
-
 _SENSOR_MSG_HANDLERS = {
     "pong":                 _handle_pong,
     "hub_ready":            _handle_hub_ready,
@@ -962,7 +1033,7 @@ _SENSOR_MSG_HANDLERS = {
     "sensor_list_complete": _handle_sensor_list_complete,
     "new_sensor_joined":    _handle_new_sensor_joined,
     "pairing_complete":     _handle_pairing_complete,
-    "unit_occupancy":       _handle_unit_occupancy,
+    "hub_aggregate":        _handle_hub_aggregate,      # replaces unit_occupancy
     "sensor_presence":      _handle_sensor_presence,
     "environment":          _handle_environment,
     "door":                 _handle_door,
@@ -1054,7 +1125,6 @@ def hub_cmd_restart():
 
 
 def hub_cmd_push_live_config():
-    """Push updated config to Hub via set_config (live update, not boot)."""
     global _hub_config_push_in_progress
     hub_cfg = conf.get("sensor_hub_config", {})
     payload = {
@@ -1065,7 +1135,7 @@ def hub_cmd_push_live_config():
         "watchdog_ping_timeout_sec":     hub_cfg.get("watchdog_ping_timeout_sec",      30),
         "door_alarm_threshold_min":      hub_cfg.get("door_alarm_threshold_min",       10),
         "heartbeat_interval_min":        hub_cfg.get("heartbeat_interval_min",         30),
-        "presence_fading_time_sec":      hub_cfg.get("presence_fading_time_sec",       30),
+        "presence_fading_time_sec":      hub_cfg.get("presence_fading_time_sec",       0),
         "door_sensor_max_silence_hours": hub_cfg.get("door_sensor_max_silence_hours",  24),
     }
     _hub_config_push_in_progress = True
@@ -1128,7 +1198,6 @@ def handle_tcp_command(msg):
         reset()
 
     elif t == "force_status":
-        # Force command — duration in hours, minimum 1, maximum 24
         status_val = msg.get("status", "")
         dur_hours  = msg.get("duration_hours", 0)
         reason     = msg.get("reason", "Manual force")
@@ -1141,8 +1210,7 @@ def handle_tcp_command(msg):
 
         if not isinstance(dur_hours, int) or dur_hours < 1 or dur_hours > 24:
             _tcp_send_ack("force_status", "error")
-            print("FORCE: invalid duration_hours {} "
-                  "(must be 1-24)".format(dur_hours))
+            print("FORCE: invalid duration_hours {} (must be 1-24)".format(dur_hours))
             return
 
         _apply_force(status_val, dur_hours, reason)
@@ -1160,7 +1228,6 @@ def handle_tcp_command(msg):
             state["pending_status"]      = None
             state["pending_apply_epoch"] = 0
         tcp_forward({"type": "pending_update", "pending_status": None})
-        # Re-send current status so debugger is always correct
         current = state.get("current_decided_status")
         if current:
             tcp_forward({"type": "unit_state_update", "status": current})
@@ -1200,8 +1267,7 @@ def handle_tcp_command(msg):
         with _state_lock:
             if not _hub_config_push_in_progress:
                 _hub_config_push_in_progress = True
-                _thread.start_new_thread(
-                    lambda: (hub_cmd_push_live_config()), ())
+                _thread.start_new_thread(lambda: (hub_cmd_push_live_config()), ())
         _tcp_send_ack("set_hub_config")
         print("HUB CONFIG updated — pushing to Hub")
         tcp_forward(build_state_snapshot())
@@ -1243,7 +1309,6 @@ def handle_tcp_command(msg):
             tcp_forward(build_state_snapshot())
 
     elif t == "start_watchdog":
-        # Operator can also manually trigger start_watchdog
         send_to_sensor_hub({"type": "start_watchdog"})
         _tcp_send_ack("start_watchdog")
 
@@ -1320,7 +1385,6 @@ def sensor_rx_loop():
 
 
 def sched_rx_loop():
-    """Scheduler UART disabled until Phase 4."""
     while True:
         utime.sleep_ms(500)
 
@@ -1330,11 +1394,6 @@ def sched_rx_loop():
 # ============================================================================
 
 def pending_worker():
-    """
-    Runs every second.
-    1. Checks force expiry — clears and recalculates if expired.
-    2. Checks pending buffer — applies when timer expires.
-    """
     while True:
         try:
             with _state_lock:
@@ -1346,7 +1405,6 @@ def pending_worker():
                     now_ep     = now_epoch_utc()
                     if expires_ep > 0 and now_ep >= expires_ep:
                         print("FORCE EXPIRED — returning to automatic")
-                        # Clear force inside lock — recalc will run below
                         conf["force"] = {
                             "active":        False,
                             "status":        "",
@@ -1356,8 +1414,6 @@ def pending_worker():
                         }
                         save_config()
                         tcp_forward({"type": "force_update", "active": False})
-                        # Buffer restarts fresh from now if natural state
-                        # would be Vacant or Sold Vacant
                         recalc_and_act()
 
                 # ── Pending buffer check ──────────────────────────────────
@@ -1369,13 +1425,11 @@ def pending_worker():
                         if now_ep >= t:
                             latest = decide_status(
                                 state["last_sensor_status"], now_ep)
-                            print("PENDING due: pending={} latest={}".format(
-                                  p, latest))
+                            print("PENDING due: pending={} latest={}".format(p, latest))
                             if latest == p:
                                 apply_immediate(p)
                             else:
-                                print("PENDING cancelled — conditions changed "
-                                      "to {}".format(latest))
+                                print("PENDING cancelled — conditions changed to {}".format(latest))
                                 apply_immediate(latest, force_send=True)
                             state["pending_status"]      = None
                             state["pending_apply_epoch"] = 0
@@ -1401,11 +1455,6 @@ def _maybe_start_tcp_server():
 
 
 def tcp_server_thread():
-    """
-    Handles one debugger client at a time.
-    On connect: switch to Debug mode, pause MQTT.
-    On disconnect: switch to Production mode, resume MQTT.
-    """
     global _tcp_client, _debug_mode
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1443,8 +1492,7 @@ def tcp_server_thread():
                     if ch == ord('\n'):
                         if rx_pos > 0:
                             try:
-                                s   = bytes(_rx_tcp_buf[:rx_pos]).decode(
-                                          "utf-8").strip()
+                                s   = bytes(_rx_tcp_buf[:rx_pos]).decode("utf-8").strip()
                                 msg = json.loads(s)
                                 if isinstance(msg, dict):
                                     handle_tcp_command(msg)
@@ -1553,7 +1601,7 @@ def wifi_and_internet_thread():
         print("WIFI: connected IP={}".format(_wifi_ip))
         _maybe_start_tcp_server()
 
-    retries       = 3
+    retries = 3
     internet_found = False
     for attempt in range(retries):
         if _check_internet():
