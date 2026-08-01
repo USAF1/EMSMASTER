@@ -64,7 +64,8 @@ DEFAULT_CONFIG = {
         "watchdog_ping_timeout_sec":      30,
         "door_alarm_threshold_min":       10,
         "heartbeat_interval_min":         30,
-        "presence_fading_time_sec":       0,
+        "presence_fading_time_sec":       30,     # was 0 — 30 = Z2M-stable default
+        "motion_sensitivity":             9,      # NEW — global default sensitivity
         "door_sensor_max_silence_hours":  24,
         "sensor_names":                   {}
     }

@@ -15,31 +15,16 @@
 #   - Applies booking window → 4-state decision
 #   - Applies buffer period (buffer_minutes)
 #   - Sends set_status to Scheduler
+#   - Pushes per-sensor fading_time / motion sensitivity to the Hub
 #
 # Unit occupancy rules (Master):
-#   VACANT → OCCUPIED:
-#     Door CLOSED transition AND any presence sensor YES
-#     (within DOOR_PENDING_WINDOW_SEC of door close)
-#   OCCUPIED → VACANT:
-#     Door CLOSED transition AND all presence sensors NO
-#     (within DOOR_PENDING_WINDOW_SEC of door close)
-#   Presence change alone:
-#     Updates _presence dict
-#     Re-evaluates if a door was recently closed (within window)
-#     Does NOT change unit state alone — door event always required
+#   VACANT → OCCUPIED:  Door CLOSED transition AND any presence sensor YES
+#   OCCUPIED → VACANT:  Door CLOSED transition AND all presence sensors NO
+#   Presence change alone: updates _presence; re-evaluates only if a door was
+#                          recently closed (within DOOR_PENDING_WINDOW_SEC).
 #
-# Debugger display:
-#   Orange box (Unit Occupancy State / big label) = Master 4-state decision
-#   Red box   (Sensor: label)                    = Hub aggregate (presence OR)
-#
-# Changes from previous main.py:
-#   - UART_RX_BUF_MAX increased 512 → 1024
-#   - hub_init includes utc_epoch (Master's current epoch)
-#   - hub_aggregate handler added (replaces unit_occupancy from Hub)
-#   - unit_occupancy handler removed (Hub no longer sends this)
-#   - Master unit occupancy engine: _presence, _door dicts + evaluate functions
-#   - state_snapshot includes hub_aggregate field
-#   - sensor_presence handler updates _presence and may re-evaluate
+# set_sensor_config: Debugger → Master → Hub. Pushes fading_time / sensitivity
+#                    to a presence sensor (ZG-204ZV / ZG-205Z/A).
 
 import utime
 import ujson as json
@@ -53,7 +38,7 @@ import master_config as cfg
 # CONSTANTS
 # ============================================================================
 
-UART_RX_BUF_MAX          = 1024  # increased from 512 — config_response with 3+ sensors
+UART_RX_BUF_MAX          = 1024
 MAIN_LOOP_TICK_MS        = 1000
 TCP_PORT                 = 8765
 TCP_RX_BUF_MAX           = 1024
@@ -70,7 +55,7 @@ WATCHDOG_ACK_TIMEOUT_MS  = 5000
 
 # How long after a door close to accept presence events for re-evaluation
 DOOR_PENDING_WINDOW_SEC  = 30
-MPY_TO_UNIX_EPOCH = 946684800
+MPY_TO_UNIX_EPOCH        = 946684800
 
 # ============================================================================
 # UART INITIALISATION
@@ -133,17 +118,14 @@ _debug_mode = False
 
 # ============================================================================
 # MASTER UNIT OCCUPANCY ENGINE
-#
-# Hub sends raw sensor events. Master tracks state and evaluates.
-#
-# _presence: {"Sensor_1": {"state": True,  "ts": "2026-07-31 13:00:00"}}
-# _door:     {"Sensor_2": {"state": "CLOSED", "ts": "...", "closed_at": epoch}}
-# _hub_aggregate: "occupied" or "vacant" — raw Hub presence OR
 # ============================================================================
 
 _presence      = {}   # per presence sensor: state + timestamp
 _door          = {}   # per door sensor: state + timestamp + closed_at
 _hub_aggregate = "vacant"
+
+# Live per-sensor config captured from config_response (for snapshots/UI)
+_sensor_live   = {}   # idx(int) -> {fading_time, sensitivity, supports_config, ...}
 
 def _utc_now_str():
     t = utime.localtime()
@@ -164,7 +146,7 @@ def _evaluate_unit_occupancy_on_door_close():
     has_presence_sensors = len(_presence) > 0
 
     if not has_presence_sensors:
-        return  # no presence sensors online — cannot evaluate
+        return
 
     current = state["last_sensor_status"]
 
@@ -190,7 +172,6 @@ def _maybe_evaluate_on_presence_change():
     """
     Called when a presence sensor state changes.
     Only re-evaluates if a door was recently closed (within DOOR_PENDING_WINDOW_SEC).
-    This handles the fading time race — presence goes NO slightly after door close.
     """
     if _force_active():
         return
@@ -504,7 +485,7 @@ def build_state_snapshot():
             "firmware_version":     cfg.FIRMWARE_VERSION,
             "unit_state":           state["current_decided_status"] or "Unknown",
             "sensor_occupancy":     state["last_sensor_status"],
-            "hub_aggregate":        _hub_aggregate,     # raw Hub presence OR
+            "hub_aggregate":        _hub_aggregate,
             "pending_status":       state["pending_status"],
             "pending_apply_epoch":  state["pending_apply_epoch"],
             "force_active":         force.get("active",        False),
@@ -543,15 +524,16 @@ def _build_hub_init():
         "type":                          "hub_init",
         "mode":                          "debug" if _debug_mode else "production",
         "firmware_version":              cfg.FIRMWARE_VERSION,
-        "utc_epoch":                     now_epoch_utc() + MPY_TO_UNIX_EPOCH,   # Hub uses this for real UTC timestamps
+        "utc_epoch":                     now_epoch_utc() + MPY_TO_UNIX_EPOCH,
         "pairing_duration_sec":          hub_cfg.get("pairing_duration_sec",          120),
         "watchdog_enable":               hub_cfg.get("watchdog_enable",                True),
         "watchdog_interval_min":         hub_cfg.get("watchdog_interval_min",          60),
         "watchdog_ping_timeout_sec":     hub_cfg.get("watchdog_ping_timeout_sec",      30),
         "door_alarm_threshold_min":      hub_cfg.get("door_alarm_threshold_min",       10),
         "heartbeat_interval_min":        hub_cfg.get("heartbeat_interval_min",         30),
-        "presence_fading_time_sec":      hub_cfg.get("presence_fading_time_sec",       0),
+        "presence_fading_time_sec":      hub_cfg.get("presence_fading_time_sec",       30),
         "door_sensor_max_silence_hours": hub_cfg.get("door_sensor_max_silence_hours",  24),
+        "motion_sensitivity":            hub_cfg.get("motion_sensitivity",             9),
     }
 
 
@@ -829,10 +811,8 @@ def _handle_pairing_complete(msg):
 
 def _handle_hub_aggregate(msg):
     """
-    Hub aggregate = OR of all online presence sensors.
-    No door logic — pure presence truth from the Hub.
-    Updates the red box (Sensor: label) in the Debugger.
-    Does NOT directly change unit state — Master's occupancy engine does that.
+    Hub aggregate = OR of all online presence sensors. No door logic.
+    Updates the red box in the Debugger. Does NOT change unit state directly.
     """
     global _hub_aggregate
     raw = msg.get("state", "VACANT")
@@ -840,19 +820,12 @@ def _handle_hub_aggregate(msg):
         return
     _hub_aggregate = raw.strip().upper()
     print("HUB AGGREGATE: {}".format(_hub_aggregate))
-    # Forward to Debugger — updates the "Sensor:" label (red box in image 4)
     tcp_forward(msg)
-    # Also send as sensor_occupancy update so Debugger label stays in sync
     occ_lower = "occupied" if _hub_aggregate == "OCCUPIED" else "vacant"
     tcp_forward({"type": "hub_aggregate_update", "state": occ_lower})
 
 
 def _handle_sensor_presence(msg):
-    """
-    Updates local _presence dict and may re-evaluate unit occupancy.
-    Presence change alone does NOT change unit state unless a door
-    was recently closed (within DOOR_PENDING_WINDOW_SEC).
-    """
     sensor    = msg.get("sensor", "")
     state_val = msg.get("state", "NO")
     ts        = msg.get("ts_utc", _utc_now_str())
@@ -867,7 +840,6 @@ def _handle_sensor_presence(msg):
     print("PRESENCE: {} {}".format(sensor, state_val))
     tcp_forward(msg)
 
-    # Re-evaluate if door was recently closed (handles fading race condition)
     _maybe_evaluate_on_presence_change()
 
 
@@ -884,10 +856,6 @@ def _handle_environment(msg):
 
 
 def _handle_door(msg):
-    """
-    Updates local _door dict and evaluates unit occupancy on CLOSE transition.
-    This is the primary occupancy trigger — CLOSED + sensors decide direction.
-    """
     sensor    = msg.get("sensor", "")
     state_val = msg.get("state", "")
     ts        = msg.get("ts_utc", _utc_now_str())
@@ -906,7 +874,7 @@ def _handle_door(msg):
             "opened_at": now_epoch,
             "closed_at": _door.get(sensor, {}).get("closed_at", 0)
         }
-    else:  # CLOSED
+    else:
         _door[sensor] = {
             "state":     "CLOSED",
             "ts":        ts,
@@ -917,7 +885,6 @@ def _handle_door(msg):
     print("DOOR: {} {}".format(sensor, state_val))
     tcp_forward(msg)
 
-    # Evaluate unit occupancy only on OPEN→CLOSED transition
     if state_val == "CLOSED" and was == "OPEN":
         print("DOOR CLOSED transition — evaluating unit occupancy")
         _evaluate_unit_occupancy_on_door_close()
@@ -939,7 +906,6 @@ def _handle_sensor_health(msg):
         return
     print("SENSOR HEALTH: {} {}".format(sensor, state_val))
     if state_val.upper() == "OFFLINE":
-        # Remove from _presence so offline sensor does not block VACANT evaluation
         if sensor in _presence:
             del _presence[sensor]
             print("PRESENCE dict: removed {} (OFFLINE)".format(sensor))
@@ -963,7 +929,6 @@ def _handle_heartbeat(msg):
     agg = msg.get("hub_aggregate", "")
     fw  = msg.get("firmware_version", "?")
     print("HEARTBEAT: hub_aggregate={} fw={}".format(agg, fw))
-    # Update presence dict from heartbeat sensor list
     for s in msg.get("sensors", []):
         if not isinstance(s, dict): continue
         role = s.get("role", "")
@@ -986,18 +951,32 @@ def _handle_heartbeat(msg):
 
 def _handle_config_response(msg):
     sensors = msg.get("sensors", [])
-    if not isinstance(sensors, list): return
+    if not isinstance(sensors, list):
+        return
     hub_cfg = conf.get("sensor_hub_config", {})
     names   = hub_cfg.get("sensor_names", {})
     for s in sensors:
-        if not isinstance(s, dict): continue
+        if not isinstance(s, dict):
+            continue
         idx  = s.get("index")
         name = s.get("name")
         if idx is not None and name and isinstance(name, str):
             names[str(idx)] = name
+        if isinstance(idx, int):
+            _sensor_live[idx] = {
+                "name":            name,
+                "model":           s.get("model", ""),
+                "role":            s.get("role", ""),
+                "online":          s.get("online", False),
+                "battery":         s.get("battery", 0),
+                "fading_time":     s.get("fading_time", 0),
+                "sensitivity":     s.get("sensitivity", 0),
+                "supports_config": s.get("supports_config", False),
+            }
     conf["sensor_hub_config"]["sensor_names"] = names
     save_config()
     print("CONFIG RESPONSE: {} sensors".format(len(sensors)))
+    # Forward raw — carries fading_time/sensitivity/supports_config for the Debugger
     tcp_forward(msg)
 
 
@@ -1034,7 +1013,7 @@ _SENSOR_MSG_HANDLERS = {
     "sensor_list_complete": _handle_sensor_list_complete,
     "new_sensor_joined":    _handle_new_sensor_joined,
     "pairing_complete":     _handle_pairing_complete,
-    "hub_aggregate":        _handle_hub_aggregate,      # replaces unit_occupancy
+    "hub_aggregate":        _handle_hub_aggregate,
     "sensor_presence":      _handle_sensor_presence,
     "environment":          _handle_environment,
     "door":                 _handle_door,
@@ -1096,6 +1075,27 @@ def hub_cmd_set_sensor_name(sensor_index, name):
     })
 
 
+def hub_cmd_set_sensor_config(sensor_index, fading_time=None, sensitivity=None):
+    """
+    Push fading_time and/or motion sensitivity to a presence sensor.
+    Pass None to leave a field unchanged.
+      fading_time : 0..28800 seconds
+      sensitivity : 0..19
+    """
+    if not isinstance(sensor_index, int) or sensor_index < 0:
+        return
+    payload = {"type": "set_sensor_config", "sensor_index": sensor_index}
+    if fading_time is not None:
+        try:    payload["fading_time"] = max(0, min(28800, int(fading_time)))
+        except Exception: pass
+    if sensitivity is not None:
+        try:    payload["sensitivity"] = max(0, min(19, int(sensitivity)))
+        except Exception: pass
+    send_to_sensor_hub(payload)
+    print("HUB set_sensor_config idx={} fading={} sensitivity={}".format(
+          sensor_index, payload.get("fading_time"), payload.get("sensitivity")))
+
+
 def hub_cmd_get_config():
     send_to_sensor_hub({"type": "get_config"})
 
@@ -1136,8 +1136,9 @@ def hub_cmd_push_live_config():
         "watchdog_ping_timeout_sec":     hub_cfg.get("watchdog_ping_timeout_sec",      30),
         "door_alarm_threshold_min":      hub_cfg.get("door_alarm_threshold_min",       10),
         "heartbeat_interval_min":        hub_cfg.get("heartbeat_interval_min",         30),
-        "presence_fading_time_sec":      hub_cfg.get("presence_fading_time_sec",       0),
+        "presence_fading_time_sec":      hub_cfg.get("presence_fading_time_sec",       30),
         "door_sensor_max_silence_hours": hub_cfg.get("door_sensor_max_silence_hours",  24),
+        "motion_sensitivity":            hub_cfg.get("motion_sensitivity",             9),
     }
     _hub_config_push_in_progress = True
     send_to_sensor_hub(payload)
@@ -1171,6 +1172,17 @@ def handle_tcp_command(msg):
             _tcp_send_ack("set_sensor_name")
         else:
             _tcp_send_ack("set_sensor_name", "error")
+
+    elif t == "set_sensor_config":
+        idx = msg.get("sensor_index")
+        if not isinstance(idx, int) or idx < 0:
+            _tcp_send_ack("set_sensor_config", "error")
+            return
+        hub_cmd_set_sensor_config(idx, msg.get("fading_time"), msg.get("sensitivity"))
+        # Ask the Hub to report back applied values so the Debugger refreshes.
+        _thread.start_new_thread(
+            lambda: (utime.sleep_ms(1500), hub_cmd_get_config()), ())
+        _tcp_send_ack("set_sensor_config")
 
     elif t == "start_pairing":
         dur = msg.get("duration_sec", 120)
@@ -1257,7 +1269,7 @@ def handle_tcp_command(msg):
         for key in ("pairing_duration_sec", "watchdog_interval_min",
                     "watchdog_ping_timeout_sec", "door_alarm_threshold_min",
                     "heartbeat_interval_min", "presence_fading_time_sec",
-                    "door_sensor_max_silence_hours"):
+                    "door_sensor_max_silence_hours", "motion_sensitivity"):
             if key in msg:
                 try:    hub_cfg[key] = int(msg[key])
                 except Exception: pass
@@ -1399,7 +1411,6 @@ def pending_worker():
         try:
             with _state_lock:
 
-                # ── Force expiry check ────────────────────────────────────
                 f = conf.get("force", {})
                 if f.get("active", False):
                     expires_ep = f.get("expires_epoch", 0)
@@ -1417,7 +1428,6 @@ def pending_worker():
                         tcp_forward({"type": "force_update", "active": False})
                         recalc_and_act()
 
-                # ── Pending buffer check ──────────────────────────────────
                 if not _force_active():
                     p = state["pending_status"]
                     t = state["pending_apply_epoch"]

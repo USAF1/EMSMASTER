@@ -3,15 +3,10 @@
 debugger.py — Innovatsii EMS Pico 1 Desktop Debugger
 Version: 0.2.5
 
-Fixes in this version:
-  - unit_state_update no longer overwrites the Sensor occupancy label.
-    The sensor label shows raw sensor state (from unit_occupancy and
-    state_snapshot only). Previously it inferred sensor state from the
-    4-state booking decision — causing "Sensor: OCCUPIED" to stay stuck
-    even when all sensors reported vacant, because "UnSold Occupied"
-    mapped to "occupied" in the inference logic.
-  - Force button TypeError resolved — ForceDurationDialog is correctly
-    used in _force_status() method.
+Adds a "Sensor Tuning" tab: per presence-sensor Fading Time (0–28800s) and
+Motion Sensitivity (0–19) sliders. Values are live from the Hub's
+config_response (fading_time / sensitivity / supports_config) and are pushed
+back via set_sensor_config on slider release.
 """
 
 import socket
@@ -273,9 +268,12 @@ class DebuggerApp:
         self._last_snapshot_unit  = ""
 
         self._force_active  = False
-        self._force_status_val  = ""   # renamed to avoid clash with method
+        self._force_status_val  = ""
         self._force_expires = ""
         self._force_reason  = ""
+
+        # Tuning cards: idx(str) -> dict of widgets
+        self._tuning_cards = {}
 
         root.title(
             "Innovatsii EMS — Pico 1 Debugger  v0.2.5  |  {}:{}".format(
@@ -410,18 +408,21 @@ class DebuggerApp:
 
         self._tab_dashboard = tk.Frame(nb, bg=C_BG)
         self._tab_sensors   = tk.Frame(nb, bg=C_BG)
+        self._tab_tuning    = tk.Frame(nb, bg=C_BG)
         self._tab_relays    = tk.Frame(nb, bg=C_BG)
         self._tab_config    = tk.Frame(nb, bg=C_BG)
         self._tab_logs      = tk.Frame(nb, bg=C_BG)
 
         nb.add(self._tab_dashboard, text="  Dashboard  ")
         nb.add(self._tab_sensors,   text="  Sensors  ")
+        nb.add(self._tab_tuning,    text="  Sensor Tuning  ")
         nb.add(self._tab_relays,    text="  Relays  ")
         nb.add(self._tab_config,    text="  Configuration  ")
         nb.add(self._tab_logs,      text="  Logs  ")
 
         self._build_dashboard()
         self._build_sensors()
+        self._build_tuning()
         self._build_relays()
         self._build_config()
         self._build_logs()
@@ -625,9 +626,153 @@ class DebuggerApp:
         tk.Label(
             p,
             text="Double-click a sensor to rename it.  "
-                 "Select a row then click Remove to delete.",
+                 "Select a row then click Remove to delete.  "
+                 "Tune fading/sensitivity in the Sensor Tuning tab.",
             fg=C_DIM, bg=C_BG, font=("Segoe UI", 9)
         ).grid(row=2, column=0, sticky="w", padx=12, pady=2)
+
+    # -----------------------------------------------------------------------
+    # SENSOR TUNING TAB  (fading_time + motion sensitivity)
+    # -----------------------------------------------------------------------
+
+    def _build_tuning(self):
+        p = self._tab_tuning
+        p.columnconfigure(0, weight=1)
+        p.rowconfigure(1, weight=1)
+
+        bar = tk.Frame(p, bg=C_BG)
+        bar.grid(row=0, column=0, sticky="ew", padx=8, pady=6)
+        make_button(bar, "Refresh Tuning",
+                    self._get_sensor_config,
+                    fg=C_BLUE, row=0, col=0, padx=4)
+        tk.Label(bar,
+                 text="Fading time = how long presence stays TRUE after last "
+                      "motion (0–28800s).   Sensitivity = detection strength "
+                      "(0–19).   Changes apply on release.",
+                 fg=C_DIM, bg=C_BG, font=("Segoe UI", 9)
+                 ).grid(row=0, column=1, sticky="w", padx=12)
+
+        canvas = tk.Canvas(p, bg=C_BG, highlightthickness=0)
+        canvas.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        vsb = ttk.Scrollbar(p, orient="vertical", command=canvas.yview)
+        vsb.grid(row=1, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=vsb.set)
+
+        self._tuning_holder = tk.Frame(canvas, bg=C_BG)
+        canvas.create_window((0, 0), window=self._tuning_holder, anchor="nw")
+        self._tuning_holder.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        self._tuning_placeholder = tk.Label(
+            self._tuning_holder,
+            text="No presence sensors yet. Pair a ZG-204ZV / ZG-205Z/A, "
+                 "then click Refresh Tuning.",
+            fg=C_DIM, bg=C_BG, font=("Segoe UI", 10))
+        self._tuning_placeholder.pack(anchor="w", padx=12, pady=12)
+
+    def _tuning_card(self, idx, name, model):
+        frame = tk.LabelFrame(
+            self._tuning_holder,
+            text="  [{}]  {}  ({})  ".format(idx, name, model),
+            bg=C_PANEL, fg=C_BLUE, font=("Segoe UI", 10, "bold"),
+            bd=1, relief=tk.GROOVE, labelanchor="nw")
+        frame.pack(fill=tk.X, padx=10, pady=6)
+        frame.columnconfigure(1, weight=1)
+
+        tk.Label(frame, text="Fading Time (s)", fg=C_TEXT, bg=C_PANEL,
+                 font=("Segoe UI", 10)).grid(row=0, column=0,
+                                             sticky="w", padx=10, pady=6)
+        fade_var = tk.IntVar(value=30)
+        fade_lbl = tk.Label(frame, text="30", fg=C_TEAL, bg=C_PANEL,
+                            font=("Segoe UI", 10, "bold"), width=6)
+        fade_lbl.grid(row=0, column=2, padx=8)
+        fade_scale = tk.Scale(
+            frame, from_=0, to=28800, orient=tk.HORIZONTAL,
+            variable=fade_var, showvalue=False, resolution=1,
+            bg=C_PANEL, fg=C_TEXT, troughcolor=C_BORDER,
+            highlightthickness=0, length=520,
+            command=lambda v, l=fade_lbl: l.config(text=str(int(float(v)))))
+        fade_scale.grid(row=0, column=1, sticky="ew", padx=8, pady=6)
+        fade_scale.bind("<ButtonRelease-1>",
+                        lambda e, i=idx: self._send_tuning(i))
+
+        tk.Label(frame, text="Sensitivity", fg=C_TEXT, bg=C_PANEL,
+                 font=("Segoe UI", 10)).grid(row=1, column=0,
+                                             sticky="w", padx=10, pady=6)
+        sens_var = tk.IntVar(value=9)
+        sens_lbl = tk.Label(frame, text="9", fg=C_TEAL, bg=C_PANEL,
+                            font=("Segoe UI", 10, "bold"), width=6)
+        sens_lbl.grid(row=1, column=2, padx=8)
+        sens_scale = tk.Scale(
+            frame, from_=0, to=19, orient=tk.HORIZONTAL,
+            variable=sens_var, showvalue=False, resolution=1,
+            bg=C_PANEL, fg=C_TEXT, troughcolor=C_BORDER,
+            highlightthickness=0, length=520,
+            command=lambda v, l=sens_lbl: l.config(text=str(int(float(v)))))
+        sens_scale.grid(row=1, column=1, sticky="ew", padx=8, pady=6)
+        sens_scale.bind("<ButtonRelease-1>",
+                        lambda e, i=idx: self._send_tuning(i))
+
+        return {
+            "frame":    frame,
+            "fade_var": fade_var, "fade_lbl": fade_lbl,
+            "sens_var": sens_var, "sens_lbl": sens_lbl,
+        }
+
+    def _apply_tuning_from_config(self, sensors):
+        present = set()
+        for s in sensors:
+            if not isinstance(s, dict):
+                continue
+            if not s.get("supports_config", False):
+                continue
+            idx   = str(s.get("index", "?"))
+            name  = s.get("name",  "?")
+            model = s.get("model", "?")
+            fade  = int(s.get("fading_time", 30))
+            sens  = int(s.get("sensitivity", 9))
+            present.add(idx)
+
+            card = self._tuning_cards.get(idx)
+            if card is None:
+                self._tuning_placeholder.pack_forget()
+                card = self._tuning_card(idx, name, model)
+                self._tuning_cards[idx] = card
+            else:
+                card["frame"].config(
+                    text="  [{}]  {}  ({})  ".format(idx, name, model))
+
+            card["fade_var"].set(fade)
+            card["fade_lbl"].config(text=str(fade))
+            card["sens_var"].set(sens)
+            card["sens_lbl"].config(text=str(sens))
+
+        for idx in list(self._tuning_cards.keys()):
+            if idx not in present:
+                self._tuning_cards[idx]["frame"].destroy()
+                del self._tuning_cards[idx]
+
+        if not self._tuning_cards:
+            self._tuning_placeholder.pack(anchor="w", padx=12, pady=12)
+
+    def _send_tuning(self, idx):
+        card = self._tuning_cards.get(str(idx))
+        if not card:
+            return
+        fade = int(card["fade_var"].get())
+        sens = int(card["sens_var"].get())
+        self._tcp.send({
+            "type":         "set_sensor_config",
+            "sensor_index": int(idx),
+            "fading_time":  fade,
+            "sensitivity":  sens,
+        })
+        self._log("TX → set_sensor_config idx={} fading={} sensitivity={}".format(
+                  idx, fade, sens), "tx")
+        self._log_event(
+            "TUNING SET  [{}]  fading={}s  sensitivity={}".format(idx, fade, sens),
+            "hub")
 
     # -----------------------------------------------------------------------
     # RELAYS TAB
@@ -712,6 +857,7 @@ class DebuggerApp:
             ("door_alarm_threshold_min",      "Door alarm threshold (min)"),
             ("heartbeat_interval_min",        "Heartbeat interval (min)"),
             ("presence_fading_time_sec",      "Presence fading time (sec)"),
+            ("motion_sensitivity",            "Motion sensitivity (0-19)"),
             ("door_sensor_max_silence_hours", "Door silence alert (hours)"),
         ]
         self._hub_entries = {}
@@ -1034,9 +1180,6 @@ class DebuggerApp:
                     "FORCE CLEARED — automatic control resumed", "force")
 
         elif t == "unit_occupancy":
-            # ── RAW sensor state from the Hub ─────────────────────────────
-            # This is the ONLY place that should update the sensor label.
-            # It reflects actual sensor detection, not the booking decision.
             s = msg.get("state", "VACANT")
             self._log_event("UNIT OCCUPANCY → {}".format(s), "unit")
             occ_colour = C_GREEN if s.upper() == "OCCUPIED" else C_DIM
@@ -1045,20 +1188,20 @@ class DebuggerApp:
             self._lbl_occ.config(
                 text="Sensor: {}".format(s.upper()), fg=occ_colour)
 
+        elif t == "hub_aggregate_update":
+            s = msg.get("state", "vacant")
+            occ_colour = C_GREEN if s.lower() == "occupied" else C_DIM
+            self._lbl_sensor_occ.config(
+                text="Sensor: {}".format(s.upper()), fg=occ_colour)
+            self._lbl_occ.config(
+                text="Sensor: {}".format(s.upper()), fg=occ_colour)
+
         elif t == "unit_state_update":
-            # ── 4-state Master decision ───────────────────────────────────
-            # Updates the UNIT state label ONLY.
-            # Does NOT touch the Sensor label — that label shows raw sensor
-            # state from unit_occupancy above. The booking decision
-            # ("UnSold Occupied", "Sold Vacant" etc.) does not tell us
-            # whether the sensor currently detects someone — those are
-            # independent pieces of information.
             status = msg.get("status", "Unknown")
             colour = STATUS_COLOURS.get(status, C_DIM)
             self._lbl_unit_big.config(text=status, fg=colour)
             self._lbl_unit.config(text="Unit: {}".format(status), fg=colour)
             self._log_event("UNIT STATE → {}".format(status), "unit")
-            # NOTE: Sensor label intentionally NOT updated here.
 
         elif t == "pending_update":
             pending = msg.get("pending_status")
@@ -1133,6 +1276,7 @@ class DebuggerApp:
             sensors = msg.get("sensors", [])
             self._apply_sensor_list(sensors)
             self._apply_hub_config_from_response(msg)
+            self._apply_tuning_from_config(sensors)
             self._log_event(
                 "SENSOR LIST updated — {} sensors".format(len(sensors)),
                 "hub")
@@ -1149,6 +1293,8 @@ class DebuggerApp:
             self._log_event("ACK  {}  {}".format(cmd, st), "dim")
             if cmd in ("set_unit_config", "set_hub_config", "set_wifi_config"):
                 self._log_event("Config saved ({})".format(cmd), "info")
+            elif cmd == "set_sensor_config":
+                self._log_event("Sensor tuning applied ✓", "hub")
             elif cmd == "start_watchdog":
                 self._log_event("Watchdog started ✓", "hub")
             elif cmd == "start_pairing":
@@ -1213,7 +1359,6 @@ class DebuggerApp:
         self._lbl_unit_big.config(text=unit, fg=colour)
         self._lbl_unit.config(text="Unit: {}".format(unit), fg=colour)
 
-        # Sensor occupancy from snapshot — raw sensor state
         occ_colour = C_GREEN if sensor == "occupied" else C_DIM
         self._lbl_sensor_occ.config(
             text="Sensor: {}".format(sensor.upper()), fg=occ_colour)
@@ -1495,11 +1640,6 @@ class DebuggerApp:
         self._log("TX → ntp_sync", "tx")
 
     def _do_force_status(self, status):
-        """
-        Opens ForceDurationDialog, then sends force_status command.
-        Named _do_force_status to avoid any name collision with instance
-        variables that store force state information.
-        """
         dlg = ForceDurationDialog(self.root, status)
         if dlg.result_hours is None:
             return
@@ -1616,7 +1756,7 @@ class DebuggerApp:
         for key in ("pairing_duration_sec", "watchdog_interval_min",
                     "watchdog_ping_timeout_sec", "door_alarm_threshold_min",
                     "heartbeat_interval_min", "presence_fading_time_sec",
-                    "door_sensor_max_silence_hours"):
+                    "motion_sensitivity", "door_sensor_max_silence_hours"):
             entry = self._hub_entries.get(key)
             if entry:
                 try:   payload[key] = int(entry.get().strip())
