@@ -70,6 +70,7 @@ WATCHDOG_ACK_TIMEOUT_MS  = 5000
 
 # How long after a door close to accept presence events for re-evaluation
 DOOR_PENDING_WINDOW_SEC  = 30
+MPY_TO_UNIX_EPOCH = 946684800
 
 # ============================================================================
 # UART INITIALISATION
@@ -542,7 +543,7 @@ def _build_hub_init():
         "type":                          "hub_init",
         "mode":                          "debug" if _debug_mode else "production",
         "firmware_version":              cfg.FIRMWARE_VERSION,
-        "utc_epoch":                     now_epoch_utc(),   # Hub uses this for real UTC timestamps
+        "utc_epoch":                     now_epoch_utc() + MPY_TO_UNIX_EPOCH,   # Hub uses this for real UTC timestamps
         "pairing_duration_sec":          hub_cfg.get("pairing_duration_sec",          120),
         "watchdog_enable":               hub_cfg.get("watchdog_enable",                True),
         "watchdog_interval_min":         hub_cfg.get("watchdog_interval_min",          60),
