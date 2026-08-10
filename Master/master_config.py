@@ -1,9 +1,16 @@
 # master_config.py
 # Master (ESP32-S3) — Pin Definitions and Default Configuration
 # Innovatsii EMS — Pico 1
-# Firmware Version: 0.2.5
+# Firmware Version: 0.3.0
+#
+# NOTE (Sensor Hub v0.3+): The Hub no longer sends the "environment" message
+# or temperature/humidity fields. Neither the ZG-204ZL PIR nor the ZG-102Z/ZA
+# door sensors report temp/hum. The Master ignores any environment messages.
+# The PIR (ZG-204ZL) accepts keep_time (fading) and sensitivity config.
+#   keep_time_sec : one of 10/30/60/120 (mapped by the Hub to DP10 enum)
+#   sensitivity   : 0=low, 1=medium, 2=high (PIR DP9 range is 0..2)
 
-FIRMWARE_VERSION   = "0.2.5"
+FIRMWARE_VERSION   = "0.3.0"
 FIRMWARE_COMPONENT = "master"
 
 SENSOR_UART_ID   = 1
@@ -64,8 +71,8 @@ DEFAULT_CONFIG = {
         "watchdog_ping_timeout_sec":      30,
         "door_alarm_threshold_min":       10,
         "heartbeat_interval_min":         30,
-        "presence_fading_time_sec":       30,     # was 0 — 30 = Z2M-stable default
-        "motion_sensitivity":             9,      # NEW — global default sensitivity
+        "presence_fading_time_sec":       30,     # ZG-204ZL keep_time default (snaps to 10/30/60/120)
+        "motion_sensitivity":             1,      # ZG-204ZL sensitivity default (0=low,1=med,2=high)
         "door_sensor_max_silence_hours":  24,
         "sensor_names":                   {}
     }
