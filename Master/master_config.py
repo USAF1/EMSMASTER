@@ -20,6 +20,7 @@
 # temp/hum fields were removed from the protocol in Hub firmware 0.3.0.
 
 FIRMWARE_VERSION   = "0.3.0"
+FIRMWARE_VERSION   = "0.3.0"
 FIRMWARE_COMPONENT = "master"
 
 SENSOR_UART_ID   = 1
