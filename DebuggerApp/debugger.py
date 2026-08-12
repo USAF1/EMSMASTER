@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
 debugger.py — Innovatsii EMS Pico 1 Desktop Debugger
-Version: 0.2.5
+Version: 0.3.0
 
-Adds a "Sensor Tuning" tab: per presence-sensor Fading Time (0–28800s) and
-Motion Sensitivity (0–19) sliders. Values are live from the Hub's
-config_response (fading_time / sensitivity / supports_config) and are pushed
-back via set_sensor_config on slider release.
+Sensor set (Hub firmware 0.3.0): ZG-204ZL PIR + ZG-102Z/ZA door.
+Neither reports temperature or humidity, so the 'environment' message and all
+temp/hum columns have been removed.
+
+The "Sensor Tuning" tab exposes the two ZG-204ZL Tuya EF00 settings:
+  keep_time   (DP10) — enum, only 10 / 30 / 60 / 120 seconds are valid
+  sensitivity (DP9)  — enum, 0=Low, 1=Medium, 2=High
+Values arrive live from the Hub's config_response / heartbeat
+(keep_time_sec / sensitivity / supports_config) and are pushed back via
+set_sensor_config when a radio button is selected.
 """
 
 import socket
@@ -30,6 +36,46 @@ DEFAULT_IP            = "192.168.0.211"
 DEFAULT_PORT          = 8765
 RECONNECT_INTERVAL_S  = 5
 RELAY_NO_DATA_TIMEOUT = 10
+
+# ============================================================================
+# ZG-204ZL PIR LIMITS (Tuya EF00) — must match Master/main.py
+# ============================================================================
+
+# DP10 keep_time is an ENUM, not free-running seconds. Only these exist.
+PIR_KEEP_TIME_CHOICES   = (10, 30, 60, 120)
+PIR_KEEP_TIME_DEFAULT   = 30
+# DP9 sensitivity enum.
+PIR_SENSITIVITY_LABELS  = ((0, "Low"), (1, "Medium"), (2, "High"))
+PIR_SENSITIVITY_DEFAULT = 1
+
+
+def _snap_keep_time(sec):
+    """Snap an arbitrary seconds value to the nearest valid DP10 enum value."""
+    try:
+        sec = int(sec)
+    except (TypeError, ValueError):
+        return PIR_KEEP_TIME_DEFAULT
+    best = PIR_KEEP_TIME_CHOICES[0]
+    for c in PIR_KEEP_TIME_CHOICES:
+        if abs(c - sec) < abs(best - sec):
+            best = c
+    return best
+
+
+def _clamp_sensitivity(val):
+    """Clamp to the DP9 enum range 0..2."""
+    try:
+        val = int(val)
+    except (TypeError, ValueError):
+        return PIR_SENSITIVITY_DEFAULT
+    return max(0, min(2, val))
+
+
+def _sensitivity_label(val):
+    for v, label in PIR_SENSITIVITY_LABELS:
+        if v == val:
+            return label
+    return str(val)
 
 # ============================================================================
 # COLOURS — dark theme
@@ -601,20 +647,20 @@ class DebuggerApp:
                     fg=C_RED, row=0, col=4, padx=4)
 
         cols = ("index", "name", "model", "role",
-                "online", "state", "battery", "temp", "hum")
+                "online", "state", "battery", "keep", "sens")
         self._sensor_tree = ttk.Treeview(
             p, columns=cols, show="headings", height=15)
 
         headers = [
-            ("index",   "#",       50),
-            ("name",    "Name",   160),
-            ("model",   "Model",  120),
-            ("role",    "Role",    90),
-            ("online",  "Online",  70),
-            ("state",   "State",   90),
-            ("battery", "Battery", 70),
-            ("temp",    "Temp °C", 80),
-            ("hum",     "Hum %",   70),
+            ("index",   "#",         50),
+            ("name",    "Name",     160),
+            ("model",   "Model",    120),
+            ("role",    "Role",      90),
+            ("online",  "Online",    70),
+            ("state",   "State",     90),
+            ("battery", "Battery",   70),
+            ("keep",    "Keep (s)",  80),
+            ("sens",    "Sens",      80),
         ]
         for col_id, heading, width in headers:
             self._sensor_tree.heading(col_id, text=heading)
@@ -627,12 +673,12 @@ class DebuggerApp:
             p,
             text="Double-click a sensor to rename it.  "
                  "Select a row then click Remove to delete.  "
-                 "Tune fading/sensitivity in the Sensor Tuning tab.",
+                 "Tune PIR keep time / sensitivity in the Sensor Tuning tab.",
             fg=C_DIM, bg=C_BG, font=("Segoe UI", 9)
         ).grid(row=2, column=0, sticky="w", padx=12, pady=2)
 
     # -----------------------------------------------------------------------
-    # SENSOR TUNING TAB  (fading_time + motion sensitivity)
+    # SENSOR TUNING TAB  (ZG-204ZL PIR: keep_time + motion sensitivity)
     # -----------------------------------------------------------------------
 
     def _build_tuning(self):
@@ -646,9 +692,10 @@ class DebuggerApp:
                     self._get_sensor_config,
                     fg=C_BLUE, row=0, col=0, padx=4)
         tk.Label(bar,
-                 text="Fading time = how long presence stays TRUE after last "
-                      "motion (0–28800s).   Sensitivity = detection strength "
-                      "(0–19).   Changes apply on release.",
+                 text="Keep time = how long the PIR holds presence TRUE after "
+                      "the last motion (10/30/60/120 s only).   "
+                      "Sensitivity = Low / Medium / High.   "
+                      "Changes apply immediately.",
                  fg=C_DIM, bg=C_BG, font=("Segoe UI", 9)
                  ).grid(row=0, column=1, sticky="w", padx=12)
 
@@ -666,7 +713,7 @@ class DebuggerApp:
 
         self._tuning_placeholder = tk.Label(
             self._tuning_holder,
-            text="No presence sensors yet. Pair a ZG-204ZV / ZG-205Z/A, "
+            text="No PIR sensors yet. Pair a ZG-204ZL, "
                  "then click Refresh Tuning.",
             fg=C_DIM, bg=C_BG, font=("Segoe UI", 10))
         self._tuning_placeholder.pack(anchor="w", padx=12, pady=12)
@@ -680,44 +727,43 @@ class DebuggerApp:
         frame.pack(fill=tk.X, padx=10, pady=6)
         frame.columnconfigure(1, weight=1)
 
-        tk.Label(frame, text="Fading Time (s)", fg=C_TEXT, bg=C_PANEL,
+        # ── Keep time — DP10 enum, only 10/30/60/120 s are valid ─────────────
+        tk.Label(frame, text="Keep Time", fg=C_TEXT, bg=C_PANEL,
                  font=("Segoe UI", 10)).grid(row=0, column=0,
                                              sticky="w", padx=10, pady=6)
-        fade_var = tk.IntVar(value=30)
-        fade_lbl = tk.Label(frame, text="30", fg=C_TEAL, bg=C_PANEL,
-                            font=("Segoe UI", 10, "bold"), width=6)
-        fade_lbl.grid(row=0, column=2, padx=8)
-        fade_scale = tk.Scale(
-            frame, from_=0, to=28800, orient=tk.HORIZONTAL,
-            variable=fade_var, showvalue=False, resolution=1,
-            bg=C_PANEL, fg=C_TEXT, troughcolor=C_BORDER,
-            highlightthickness=0, length=520,
-            command=lambda v, l=fade_lbl: l.config(text=str(int(float(v)))))
-        fade_scale.grid(row=0, column=1, sticky="ew", padx=8, pady=6)
-        fade_scale.bind("<ButtonRelease-1>",
-                        lambda e, i=idx: self._send_tuning(i))
+        keep_var = tk.IntVar(value=PIR_KEEP_TIME_DEFAULT)
+        keep_row = tk.Frame(frame, bg=C_PANEL)
+        keep_row.grid(row=0, column=1, sticky="w", padx=8, pady=6)
+        for col, secs in enumerate(PIR_KEEP_TIME_CHOICES):
+            tk.Radiobutton(
+                keep_row, text="{} s".format(secs), value=secs,
+                variable=keep_var,
+                command=lambda i=idx: self._send_tuning(i),
+                bg=C_PANEL, fg=C_TEXT, selectcolor=C_BG,
+                activebackground=C_PANEL, activeforeground=C_TEAL,
+                font=("Segoe UI", 10), highlightthickness=0, bd=0
+            ).grid(row=0, column=col, padx=8)
 
+        # ── Sensitivity — DP9 enum: 0=low, 1=medium, 2=high ──────────────────
         tk.Label(frame, text="Sensitivity", fg=C_TEXT, bg=C_PANEL,
                  font=("Segoe UI", 10)).grid(row=1, column=0,
                                              sticky="w", padx=10, pady=6)
-        sens_var = tk.IntVar(value=9)
-        sens_lbl = tk.Label(frame, text="9", fg=C_TEAL, bg=C_PANEL,
-                            font=("Segoe UI", 10, "bold"), width=6)
-        sens_lbl.grid(row=1, column=2, padx=8)
-        sens_scale = tk.Scale(
-            frame, from_=0, to=19, orient=tk.HORIZONTAL,
-            variable=sens_var, showvalue=False, resolution=1,
-            bg=C_PANEL, fg=C_TEXT, troughcolor=C_BORDER,
-            highlightthickness=0, length=520,
-            command=lambda v, l=sens_lbl: l.config(text=str(int(float(v)))))
-        sens_scale.grid(row=1, column=1, sticky="ew", padx=8, pady=6)
-        sens_scale.bind("<ButtonRelease-1>",
-                        lambda e, i=idx: self._send_tuning(i))
+        sens_var = tk.IntVar(value=PIR_SENSITIVITY_DEFAULT)
+        sens_row = tk.Frame(frame, bg=C_PANEL)
+        sens_row.grid(row=1, column=1, sticky="w", padx=8, pady=6)
+        for col, (val, label) in enumerate(PIR_SENSITIVITY_LABELS):
+            tk.Radiobutton(
+                sens_row, text=label, value=val, variable=sens_var,
+                command=lambda i=idx: self._send_tuning(i),
+                bg=C_PANEL, fg=C_TEXT, selectcolor=C_BG,
+                activebackground=C_PANEL, activeforeground=C_TEAL,
+                font=("Segoe UI", 10), highlightthickness=0, bd=0
+            ).grid(row=0, column=col, padx=8)
 
         return {
             "frame":    frame,
-            "fade_var": fade_var, "fade_lbl": fade_lbl,
-            "sens_var": sens_var, "sens_lbl": sens_lbl,
+            "keep_var": keep_var,
+            "sens_var": sens_var,
         }
 
     def _apply_tuning_from_config(self, sensors):
@@ -725,13 +771,16 @@ class DebuggerApp:
         for s in sensors:
             if not isinstance(s, dict):
                 continue
+            # Only the ZG-204ZL PIR accepts tuning; the Hub flags it for us.
             if not s.get("supports_config", False):
                 continue
             idx   = str(s.get("index", "?"))
             name  = s.get("name",  "?")
             model = s.get("model", "?")
-            fade  = int(s.get("fading_time", 30))
-            sens  = int(s.get("sensitivity", 9))
+            keep  = _snap_keep_time(s.get("keep_time_sec",
+                                          PIR_KEEP_TIME_DEFAULT))
+            sens  = _clamp_sensitivity(s.get("sensitivity",
+                                             PIR_SENSITIVITY_DEFAULT))
             present.add(idx)
 
             card = self._tuning_cards.get(idx)
@@ -743,10 +792,12 @@ class DebuggerApp:
                 card["frame"].config(
                     text="  [{}]  {}  ({})  ".format(idx, name, model))
 
-            card["fade_var"].set(fade)
-            card["fade_lbl"].config(text=str(fade))
+            # Suppress the radiobutton command while syncing from the Hub,
+            # otherwise setting the variable echoes a write straight back.
+            card["syncing"] = True
+            card["keep_var"].set(keep)
             card["sens_var"].set(sens)
-            card["sens_lbl"].config(text=str(sens))
+            card["syncing"] = False
 
         for idx in list(self._tuning_cards.keys()):
             if idx not in present:
@@ -758,20 +809,21 @@ class DebuggerApp:
 
     def _send_tuning(self, idx):
         card = self._tuning_cards.get(str(idx))
-        if not card:
+        if not card or card.get("syncing"):
             return
-        fade = int(card["fade_var"].get())
-        sens = int(card["sens_var"].get())
+        keep = _snap_keep_time(card["keep_var"].get())
+        sens = _clamp_sensitivity(card["sens_var"].get())
         self._tcp.send({
-            "type":         "set_sensor_config",
-            "sensor_index": int(idx),
-            "fading_time":  fade,
-            "sensitivity":  sens,
+            "type":          "set_sensor_config",
+            "sensor_index":  int(idx),
+            "keep_time_sec": keep,
+            "sensitivity":   sens,
         })
-        self._log("TX → set_sensor_config idx={} fading={} sensitivity={}".format(
-                  idx, fade, sens), "tx")
+        self._log("TX → set_sensor_config idx={} keep_time={} sensitivity={}".format(
+                  idx, keep, sens), "tx")
         self._log_event(
-            "TUNING SET  [{}]  fading={}s  sensitivity={}".format(idx, fade, sens),
+            "TUNING SET  [{}]  keep_time={}s  sensitivity={}".format(
+                idx, keep, _sensitivity_label(sens)),
             "hub")
 
     # -----------------------------------------------------------------------
@@ -856,8 +908,8 @@ class DebuggerApp:
             ("watchdog_ping_timeout_sec",     "Ping timeout (sec)"),
             ("door_alarm_threshold_min",      "Door alarm threshold (min)"),
             ("heartbeat_interval_min",        "Heartbeat interval (min)"),
-            ("presence_fading_time_sec",      "Presence fading time (sec)"),
-            ("motion_sensitivity",            "Motion sensitivity (0-19)"),
+            ("presence_fading_time_sec",      "PIR keep time (10/30/60/120 s)"),
+            ("motion_sensitivity",            "Motion sensitivity (0=Lo 1=Med 2=Hi)"),
             ("door_sensor_max_silence_hours", "Door silence alert (hours)"),
         ]
         self._hub_entries = {}
@@ -1220,14 +1272,6 @@ class DebuggerApp:
                 "PRESENCE  {}  {}".format(sensor, sv), "presence")
             self._update_sensor_state_col(sensor, sv)
 
-        elif t == "environment":
-            tc  = msg.get("temp_c_x100",  0) / 100.0
-            hum = msg.get("hum_pct_x100", 0) / 100.0
-            self._log_event(
-                "ENV  {}  {:.1f}°C  {:.1f}%".format(
-                    msg.get("sensor", ""), tc, hum), "env")
-            self._update_sensor_env(msg.get("sensor", ""), tc, hum)
-
         elif t == "door":
             sensor = msg.get("sensor", "")
             sv     = msg.get("state", "")
@@ -1478,8 +1522,6 @@ class DebuggerApp:
                 live[vals[1]] = {
                     "state":   vals[5],
                     "battery": vals[6],
-                    "temp":    vals[7],
-                    "hum":     vals[8],
                 }
 
         self._sensors = {}
@@ -1509,14 +1551,20 @@ class DebuggerApp:
             prev_batt = prev.get("battery", "—")
             batt_v = prev_batt if (prev_batt not in ("—", "")) else batt
 
-            temp_v = prev.get("temp", "—")
-            hum_v  = prev.get("hum",  "—")
+            # PIR tuning columns — only the ZG-204ZL reports these.
+            if s.get("keep_time_sec") is not None:
+                keep_v = str(_snap_keep_time(s.get("keep_time_sec")))
+                sens_v = _sensitivity_label(
+                    _clamp_sensitivity(s.get("sensitivity")))
+            else:
+                keep_v = "—"
+                sens_v = "—"
 
             self._sensor_tree.insert(
                 "", tk.END,
                 iid=str(idx),
                 values=(idx, name, model, role,
-                        online, state_v, batt_v, temp_v, hum_v))
+                        online, state_v, batt_v, keep_v, sens_v))
             self._sensors[str(idx)] = s
             self._sensors[name]     = s
 
@@ -1536,6 +1584,11 @@ class DebuggerApp:
                     pres = s.get("presence", None)
                     if pres is not None:
                         vals[5] = "YES" if pres else "NO"
+                if s.get("keep_time_sec") is not None:
+                    vals[7] = str(_snap_keep_time(s.get("keep_time_sec")))
+                if s.get("sensitivity") is not None:
+                    vals[8] = _sensitivity_label(
+                        _clamp_sensitivity(s.get("sensitivity")))
                 self._sensor_tree.item(iid, values=vals)
                 break
 
@@ -1544,15 +1597,6 @@ class DebuggerApp:
             vals = list(self._sensor_tree.item(iid, "values"))
             if vals[1] == name:
                 vals[5] = state_val
-                self._sensor_tree.item(iid, values=vals)
-                break
-
-    def _update_sensor_env(self, name, temp_c, hum_pct):
-        for iid in self._sensor_tree.get_children():
-            vals = list(self._sensor_tree.item(iid, "values"))
-            if vals[1] == name:
-                vals[7] = "{:.1f}".format(temp_c)
-                vals[8] = "{:.1f}".format(hum_pct)
                 self._sensor_tree.item(iid, values=vals)
                 break
 
@@ -1759,8 +1803,15 @@ class DebuggerApp:
                     "motion_sensitivity", "door_sensor_max_silence_hours"):
             entry = self._hub_entries.get(key)
             if entry:
-                try:   payload[key] = int(entry.get().strip())
-                except Exception: pass
+                try:   val = int(entry.get().strip())
+                except Exception: continue
+                # Constrain the two PIR values to what the ZG-204ZL accepts,
+                # so the UI shows the same value the Hub will actually apply.
+                if key == "presence_fading_time_sec":
+                    val = _snap_keep_time(val)
+                elif key == "motion_sensitivity":
+                    val = _clamp_sensitivity(val)
+                payload[key] = val
         self._tcp.send(payload)
         self._log("TX → set_hub_config", "tx")
 

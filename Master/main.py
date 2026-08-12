@@ -1,11 +1,21 @@
 # main.py — MASTER (ESP32-S3)
 # Innovatsii EMS — Pico 1
-# Firmware Version: 0.2.5
+# Firmware Version: 0.3.0
 #
-# ARCHITECTURE — V4.2+ (Hub sends raw events, Master calculates unit occupancy)
+# ARCHITECTURE — V5.0 (Hub sends raw events, Master calculates unit occupancy)
+#
+# SENSOR SET (Hub firmware 0.3.0):
+#   ZG-204ZL  PIR presence  — Tuya EF00: DP1 occupancy, DP4 battery,
+#                             DP9 sensitivity (0=low,1=med,2=high),
+#                             DP10 keep_time (10/30/60/120 s)
+#   ZG-102Z/ZA door contact — IAS Zone, sleepy device, never marked offline
+#
+#   Neither sensor reports temperature or humidity. The 'environment' message
+#   and all temp/hum fields have been removed from the protocol.
+#   Illuminance (DP12) is discarded by the Hub and never reaches the Master.
 #
 # Hub responsibility:
-#   - Reports sensor_presence, door, battery, environment, sensor_health
+#   - Reports sensor_presence, door, battery, sensor_health
 #   - Reports hub_aggregate (OR of all online presence sensors — no door logic)
 #   - Sends real UTC timestamps on all messages (from utc_epoch in hub_init)
 #
@@ -15,16 +25,22 @@
 #   - Applies booking window → 4-state decision
 #   - Applies buffer period (buffer_minutes)
 #   - Sends set_status to Scheduler
-#   - Pushes per-sensor fading_time / motion sensitivity to the Hub
+#   - Pushes per-sensor keep_time / motion sensitivity to the Hub
 #
 # Unit occupancy rules (Master):
-#   VACANT → OCCUPIED:  Door CLOSED transition AND any presence sensor YES
-#   OCCUPIED → VACANT:  Door CLOSED transition AND all presence sensors NO
-#   Presence change alone: updates _presence; re-evaluates only if a door was
-#                          recently closed (within DOOR_PENDING_WINDOW_SEC).
+#   The ZG-204ZL is a PIR: it latches YES for keep_time (10-120 s) after the
+#   last motion, so a departing guest's own movement keeps it YES through the
+#   door close. Presence sampled at that instant can never prove absence.
 #
-# set_sensor_config: Debugger → Master → Hub. Pushes fading_time / sensitivity
-#                    to a presence sensor (ZG-204ZV / ZG-205Z/A).
+#   -> OCCUPIED: door CLOSED transition with any presence YES. Taken
+#                immediately — the safe direction.
+#   -> VACANT:   never taken at the door close. The close arms a confirmation
+#                window (vacancy_confirm_sec); vacancy is concluded only if no
+#                motion is seen after the stale exit latch has expired. Fresh
+#                motion, or the door reopening, cancels it.
+#
+# set_sensor_config: Debugger → Master → Hub. Pushes keep_time_sec / sensitivity
+#                    to a ZG-204ZL PIR sensor.
 
 import utime
 import ujson as json
@@ -38,7 +54,7 @@ import master_config as cfg
 # CONSTANTS
 # ============================================================================
 
-UART_RX_BUF_MAX          = 1024
+UART_RX_BUF_MAX          = 2048
 MAIN_LOOP_TICK_MS        = 1000
 TCP_PORT                 = 8765
 TCP_RX_BUF_MAX           = 1024
@@ -53,9 +69,41 @@ HUB_INIT_ACK_TIMEOUT_MS  = 5000
 HUB_READY_TIMEOUT_MS     = 120000
 WATCHDOG_ACK_TIMEOUT_MS  = 5000
 
-# How long after a door close to accept presence events for re-evaluation
-DOOR_PENDING_WINDOW_SEC  = 30
 MPY_TO_UNIX_EPOCH        = 946684800
+
+# ── ZG-204ZL PIR limits (Tuya EF00) ─────────────────────────────────────────
+# DP10 keep_time is an ENUM, not a free-running seconds value. Only these four
+# values exist; anything else is snapped to the nearest one by the Hub.
+PIR_KEEP_TIME_CHOICES = (10, 30, 60, 120)
+PIR_KEEP_TIME_DEFAULT = 30
+# DP9 sensitivity enum: 0=low, 1=medium, 2=high.
+PIR_SENSITIVITY_MIN   = 0
+PIR_SENSITIVITY_MAX   = 2
+PIR_SENSITIVITY_DEFAULT = 1
+
+
+def _snap_keep_time(sec):
+    """Snap an arbitrary seconds value to the nearest valid DP10 enum value."""
+    try:
+        sec = int(sec)
+    except Exception:
+        return PIR_KEEP_TIME_DEFAULT
+    best = PIR_KEEP_TIME_CHOICES[0]
+    for c in PIR_KEEP_TIME_CHOICES:
+        if abs(c - sec) < abs(best - sec):
+            best = c
+    return best
+
+
+def _clamp_sensitivity(val):
+    """Clamp to the DP9 enum range 0..2."""
+    try:
+        val = int(val)
+    except Exception:
+        return PIR_SENSITIVITY_DEFAULT
+    if val < PIR_SENSITIVITY_MIN: return PIR_SENSITIVITY_MIN
+    if val > PIR_SENSITIVITY_MAX: return PIR_SENSITIVITY_MAX
+    return val
 
 # ============================================================================
 # UART INITIALISATION
@@ -125,108 +173,264 @@ _door          = {}   # per door sensor: state + timestamp + closed_at
 _hub_aggregate = "vacant"
 
 # Live per-sensor config captured from config_response (for snapshots/UI)
-_sensor_live   = {}   # idx(int) -> {fading_time, sensitivity, supports_config, ...}
+_sensor_live   = {}   # idx(int) -> {keep_time_sec, sensitivity, supports_config, ...}
+
+# ── Vacancy confirmation window ─────────────────────────────────────────────
+#
+# WHY THIS EXISTS
+#
+# The ZG-204ZL is a PIR, not an mmWave presence sensor. It reports MOTION and
+# then latches YES for keep_time (10/30/60/120 s, default 30) after the last
+# movement it saw. Two consequences drive this design:
+#
+#   1. To leave the unit a guest must walk past the PIR to reach the door.
+#      At the instant the door clicks shut the PIR is therefore ALWAYS still
+#      latched YES. Sampling presence at that moment can never yield "vacant",
+#      so the old "door closed + all NO -> VACANT" rule could never fire.
+#
+#   2. A PIR cannot see a motionless person. mmWave could. So "no motion" is
+#      only evidence of absence once enough time has passed.
+#
+# The two directions are therefore NOT symmetric, because the risks are not
+# symmetric: a false "occupied" wastes a little power, a false "vacant" cuts
+# power on a guest who is actually home. So:
+#
+#   -> OCCUPIED  is taken immediately and optimistically on a door close.
+#   -> VACANT    is never taken on the door close itself. The close arms a
+#                confirmation window; vacancy is only concluded at the end of
+#                it, and any fresh motion cancels it.
+#
+_vacancy_eval = {
+    "active":       False,
+    "quiet_until":  0,    # epoch after which the stale exit latch has expired
+    "decide_at":    0,    # epoch at which we conclude occupied / vacant
+    "door":         "",   # door whose close armed this window
+}
+
 
 def _utc_now_str():
     t = utime.localtime()
     return "{}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
         t[0], t[1], t[2], t[3], t[4], t[5])
 
-def _evaluate_unit_occupancy_on_door_close():
+
+def _any_presence_yes():
+    """True if any ONLINE presence sensor currently reads YES."""
+    for v in _presence.values():
+        if v.get("online", True) and v.get("state", False):
+            return True
+    return False
+
+
+def _max_keep_time_sec():
     """
-    Called when a door closes. Evaluates presence sensors to determine
-    whether unit should transition to OCCUPIED or VACANT.
-    Called with _state_lock NOT held — acquires it internally.
+    Longest PIR keep_time across known PRESENCE sensors. This is how long a
+    sensor can stay latched YES after the last motion, so the stale exit latch
+    cannot outlive it. Falls back to the configured global default.
+
+    Only PRESENCE sensors are considered: the Hub reports a keep_time_sec field
+    for every sensor, but on a door it is just the uninitialised default (30),
+    which would otherwise inflate the quiet period and delay every vacancy
+    decision — even after the PIRs were tuned down to 10 s.
+    """
+    longest = 0
+    for live in _sensor_live.values():
+        if live.get("role") != "PRESENCE":
+            continue
+        try:
+            kt = int(live.get("keep_time_sec", 0))
+        except Exception:
+            kt = 0
+        if kt > longest:
+            longest = kt
+    if longest <= 0:
+        hub_cfg = conf.get("sensor_hub_config", {})
+        longest = _snap_keep_time(
+            hub_cfg.get("presence_fading_time_sec", PIR_KEEP_TIME_DEFAULT))
+    return longest
+
+
+def _set_sensor_status(new_status):
+    """Commit a new sensor-derived occupancy and re-run the state machine."""
+    if new_status == state["last_sensor_status"]:
+        return
+    with _state_lock:
+        state["last_sensor_status"] = new_status
+        conf["last_sensor_status"]  = new_status
+        save_config()
+        recalc_and_act()
+
+
+def _cancel_vacancy_eval(reason):
+    if not _vacancy_eval["active"]:
+        return
+    _vacancy_eval["active"] = False
+    print("UNIT EVAL: vacancy window cancelled — {}".format(reason))
+    tcp_forward({"type": "vacancy_eval", "active": False, "reason": reason})
+
+
+def _arm_vacancy_eval(door_name, now_ep):
+    """Arm the post-door-close confirmation window."""
+    guard      = max(0, int(conf.get("motion_quiet_guard_sec", 5)))
+    confirm    = max(30, int(conf.get("vacancy_confirm_sec", 180)))
+    keep       = _max_keep_time_sec()
+    quiet_until = now_ep + keep + guard
+    decide_at   = now_ep + confirm
+
+    # The window must outlast the stale exit latch, otherwise we would decide
+    # while the PIR is still holding YES from the departing guest.
+    if decide_at <= quiet_until:
+        decide_at = quiet_until + 10
+
+    _vacancy_eval["active"]      = True
+    _vacancy_eval["quiet_until"] = quiet_until
+    _vacancy_eval["decide_at"]   = decide_at
+    _vacancy_eval["door"]        = door_name
+
+    print("UNIT EVAL: vacancy window armed by '{}' — keep={}s guard={}s "
+          "quiet_in={}s decide_in={}s".format(
+              door_name, keep, guard, quiet_until - now_ep, decide_at - now_ep))
+    tcp_forward({"type":          "vacancy_eval",
+                 "active":        True,
+                 "door":          door_name,
+                 "quiet_until":   quiet_until,
+                 "decide_epoch":  decide_at})
+
+
+def _evaluate_unit_occupancy_on_door_close(door_name=""):
+    """
+    Called on a door OPEN->CLOSED transition, with _state_lock NOT held.
+
+    Takes the immediate optimistic OCCUPIED decision, and always arms the
+    vacancy confirmation window so the opposite conclusion can be reached
+    later if nobody turns out to be inside.
     """
     if _force_active():
         return
-
-    any_yes = any(v.get("state", False) for v in _presence.values())
-    all_no  = not any_yes
-    has_presence_sensors = len(_presence) > 0
-
-    if not has_presence_sensors:
+    if len(_presence) == 0:
+        print("UNIT EVAL: door closed but no presence sensors — ignored")
         return
 
+    now_ep  = utime.time()
+    any_yes = _any_presence_yes()
     current = state["last_sensor_status"]
 
-    new_status = None
-    if current == "vacant" and any_yes:
-        new_status = "occupied"
-        print("UNIT EVAL: door closed + presence YES → OCCUPIED")
-    elif current == "occupied" and all_no:
-        new_status = "vacant"
-        print("UNIT EVAL: door closed + all NO → VACANT")
-    else:
-        print("UNIT EVAL: door closed, no change (current={} any_yes={} all_no={})".format(
-              current, any_yes, all_no))
+    # Fast path toward comfort. Safe direction: at worst this wastes power
+    # until the confirmation window below corrects it.
+    if any_yes and current == "vacant":
+        print("UNIT EVAL: door closed + presence YES → OCCUPIED (immediate)")
+        _set_sensor_status("occupied")
 
-    if new_status and new_status != current:
-        with _state_lock:
-            state["last_sensor_status"] = new_status
-            conf["last_sensor_status"]  = new_status
-            save_config()
-            recalc_and_act()
+    # Always arm the window — it both confirms an arrival and is the only path
+    # to vacancy. Covers the "opened the door, never came in" case too.
+    _arm_vacancy_eval(door_name, now_ep)
 
-def _maybe_evaluate_on_presence_change():
+
+def _maybe_evaluate_on_presence_change(sensor=""):
     """
-    Called when a presence sensor state changes.
-    Only re-evaluates if a door was recently closed (within DOOR_PENDING_WINDOW_SEC).
+    Called on a RISING presence edge (NO -> YES) only.
+
+    While a confirmation window is open, motion after quiet_until proves
+    somebody is inside: conclude OCCUPIED at once and close the window. Motion
+    BEFORE quiet_until is ignored because it may still be the departing
+    guest's own latch.
     """
     if _force_active():
         return
+    if not _vacancy_eval["active"]:
+        return
 
-    now = utime.time()
-    door_recently_closed = False
-    for sensor_name, d in _door.items():
-        closed_at = d.get("closed_at", 0)
-        if closed_at > 0 and (now - closed_at) <= DOOR_PENDING_WINDOW_SEC:
-            door_recently_closed = True
-            break
+    now_ep = utime.time()
+    if now_ep < _vacancy_eval["quiet_until"]:
+        print("UNIT EVAL: motion during quiet period — ignored "
+              "(may be the departing guest)")
+        return
 
-    if door_recently_closed:
-        _evaluate_unit_occupancy_on_door_close()
+    print("UNIT EVAL: fresh motion from '{}' after quiet period → OCCUPIED"
+          .format(sensor))
+    _cancel_vacancy_eval("fresh motion confirmed occupancy")
+    _set_sensor_status("occupied")
+
+
+def _tick_vacancy_eval():
+    """
+    Called once per second from pending_worker with _state_lock NOT held.
+    Concludes the confirmation window when it expires.
+    """
+    if not _vacancy_eval["active"]:
+        return
+    if _force_active():
+        _cancel_vacancy_eval("force active")
+        return
+
+    now_ep = utime.time()
+    if now_ep < _vacancy_eval["decide_at"]:
+        return
+
+    _vacancy_eval["active"] = False
+
+    if _any_presence_yes():
+        # Someone is still moving in the unit.
+        print("UNIT EVAL: window expired, presence YES → OCCUPIED")
+        tcp_forward({"type": "vacancy_eval", "active": False,
+                     "reason": "presence still YES"})
+        _set_sensor_status("occupied")
+    else:
+        # No motion since the stale exit latch expired — the unit is empty.
+        print("UNIT EVAL: window expired, no motion since quiet period → VACANT")
+        tcp_forward({"type": "vacancy_eval", "active": False,
+                     "reason": "no motion — vacant"})
+        _set_sensor_status("vacant")
 
 # ============================================================================
-# PERSISTENT CONFIG
+# CONFIG  —  master_config.py is the ONLY source of truth
 # ============================================================================
+#
+# There is no master_config.json. Configuration is loaded from
+# master_config.DEFAULT_CONFIG at every boot, so what you put in
+# master_config.py is exactly what the Master runs — copy the file to the
+# device, reset, and the change is live. No stale on-device state can
+# silently override it.
+#
+# TRADE-OFF: nothing survives a reboot. Runtime changes (force commands,
+# booking times pushed over MQTT, operator sensor renames, Wi-Fi changes made
+# from the Debugger) apply immediately and stay in RAM for the session, but
+# are lost on power cycle and revert to the values in master_config.py.
+# To make a change permanent, edit master_config.py and re-copy it.
 
 conf    = {}
 boot_ms = utime.ticks_ms()
 
 
+def _deep_copy(obj):
+    """
+    Recursive copy of plain dict/list structures. MicroPython has no reliable
+    `copy` module. Used so that runtime mutation of `conf` can never write
+    back into cfg.DEFAULT_CONFIG (nested dicts would otherwise be shared
+    references, corrupting the defaults for the rest of the session).
+    """
+    if isinstance(obj, dict):
+        return dict((k, _deep_copy(v)) for k, v in obj.items())
+    if isinstance(obj, list):
+        return [_deep_copy(v) for v in obj]
+    return obj
+
+
 def load_config():
+    """Build the running config from master_config.py. No file I/O."""
     global conf
-    try:
-        with open(cfg.CONFIG_FILE, "r") as f:
-            conf = json.load(f)
-        print("CONFIG loaded")
-    except Exception as e:
-        print("CONFIG load failed, using defaults:", e)
-        conf = {}
-    changed = False
-    def _merge(target, source):
-        nonlocal changed
-        for k, v in source.items():
-            if k not in target:
-                target[k] = v
-                changed = True
-            elif isinstance(v, dict) and isinstance(target.get(k), dict):
-                _merge(target[k], v)
-    _merge(conf, cfg.DEFAULT_CONFIG)
-    if changed:
-        save_config()
+    conf = _deep_copy(cfg.DEFAULT_CONFIG)
+    print("CONFIG loaded from master_config.py (no JSON persistence)")
 
 
 def save_config():
-    tmp = cfg.CONFIG_FILE + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            json.dump(conf, f)
-        import uos
-        uos.rename(tmp, cfg.CONFIG_FILE)
-    except Exception as e:
-        print("CONFIG save failed:", e)
+    """
+    No-op. Kept so the ~20 call sites that mutate `conf` remain valid and
+    self-documenting; changes live in RAM for the current session only.
+    Persistence was removed deliberately — master_config.py is the single
+    source of truth.
+    """
+    pass
 
 
 # ============================================================================
@@ -287,11 +491,39 @@ def _sync_ntp():
             t[0], t[1], t[2], t[3], t[4], t[5])
         print("NTP synced — UTC {}".format(utc_str))
         tcp_forward({"type": "ntp_status", "synced": True, "utc": utc_str})
+        _push_utc_epoch_to_hub()
         return True
     except Exception as e:
         print("NTP sync failed:", repr(e))
         tcp_forward({"type": "ntp_status", "synced": False})
         return False
+
+
+def _push_utc_epoch_to_hub():
+    """
+    Re-anchor the Hub's clock after NTP.
+
+    hub_init is sent the moment the Hub answers our ping, which is normally
+    several seconds BEFORE the background NTP sync completes. The Hub therefore
+    starts up believing the epoch is ~946684800 (year 2000) and stamps every
+    outbound message with a ts_utc that is ~26 years wrong.
+
+    Sending the corrected epoch here makes all subsequent Hub timestamps real
+    wall-clock UTC, as required by the architecture ("All timestamps are UTC").
+    Safe to call on every resync — the Hub simply re-anchors.
+    """
+    # Only meaningful once the Hub has accepted hub_init; before that it is
+    # not yet listening for config and hub_init will carry the epoch itself.
+    if not _hub_init_acked:
+        return
+    try:
+        send_to_sensor_hub({
+            "type":      "set_config",
+            "utc_epoch": now_epoch_utc() + MPY_TO_UNIX_EPOCH,
+        })
+        print("HUB: UTC epoch resynced after NTP")
+    except Exception as e:
+        print("HUB: UTC epoch resync failed:", repr(e))
 
 
 def parse_utc_to_epoch(dt_str):
@@ -488,6 +720,9 @@ def build_state_snapshot():
             "hub_aggregate":        _hub_aggregate,
             "pending_status":       state["pending_status"],
             "pending_apply_epoch":  state["pending_apply_epoch"],
+            "vacancy_pending":      _vacancy_eval["active"],
+            "vacancy_decide_epoch": _vacancy_eval["decide_at"] if _vacancy_eval["active"] else 0,
+            "vacancy_quiet_until":  _vacancy_eval["quiet_until"] if _vacancy_eval["active"] else 0,
             "force_active":         force.get("active",        False),
             "force_status":         force.get("status",        ""),
             "force_expires_utc":    force.get("expires_utc",   ""),
@@ -531,9 +766,13 @@ def _build_hub_init():
         "watchdog_ping_timeout_sec":     hub_cfg.get("watchdog_ping_timeout_sec",      30),
         "door_alarm_threshold_min":      hub_cfg.get("door_alarm_threshold_min",       10),
         "heartbeat_interval_min":        hub_cfg.get("heartbeat_interval_min",         30),
-        "presence_fading_time_sec":      hub_cfg.get("presence_fading_time_sec",       30),
+        "presence_fading_time_sec":      _snap_keep_time(
+                                            hub_cfg.get("presence_fading_time_sec",
+                                                        PIR_KEEP_TIME_DEFAULT)),
         "door_sensor_max_silence_hours": hub_cfg.get("door_sensor_max_silence_hours",  24),
-        "motion_sensitivity":            hub_cfg.get("motion_sensitivity",             9),
+        "motion_sensitivity":            _clamp_sensitivity(
+                                            hub_cfg.get("motion_sensitivity",
+                                                        PIR_SENSITIVITY_DEFAULT)),
     }
 
 
@@ -641,7 +880,13 @@ def _boot_controller_thread():
     print("BOOT [C] Waiting for sensor rejoin to complete...")
     tcp_forward({"type": "boot_phase", "phase": "C_REJOIN"})
 
-    _sensor_list_complete = False
+    # Do NOT reset _sensor_list_complete here. The Hub's rejoin_task sends
+    # sensor_status/sensor_list_complete BEFORE hub_ready_task sends hub_ready,
+    # so the flag is normally already set while we were still in Phase B.
+    # Clearing it discarded that fact and forced a full 240 s stall, which
+    # meant start_watchdog was never sent and heartbeats never started.
+    if _sensor_list_complete:
+        print("BOOT [C] sensor_list_complete already received during Phase B")
     deadline = utime.ticks_add(utime.ticks_ms(), 240000)
     while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
         if _sensor_list_complete:
@@ -670,6 +915,12 @@ def _boot_controller_thread():
 
     if not _watchdog_start_acked:
         print("BOOT [D] WARNING — start_watchdog not ACKed, continuing anyway")
+
+    # Close the boot race: hub_init may have been built before NTP completed,
+    # leaving the Hub anchored to year 2000. If we have real time by now,
+    # re-anchor it so every Hub ts_utc is true wall-clock UTC.
+    if _ntp_synced:
+        _push_utc_epoch_to_hub()
 
     _boot_phase = "READY"
     _hub_state  = "READY"
@@ -766,7 +1017,28 @@ def _handle_sensor_status(msg):
     idx    = msg.get("index",  -1)
     name   = msg.get("name",   "?")
     online = msg.get("online", False)
+    role   = msg.get("role",   "")
     print("SENSOR STATUS: [{}] {} online={}".format(idx, name, online))
+
+    # Seed the occupancy dicts from the boot-time sensor list. These messages
+    # arrive during Phase B/C, well before the first config_response, so
+    # without this a door close early in the session would find empty dicts.
+    if isinstance(name, str) and name:
+        if role == "PRESENCE":
+            pres  = msg.get("presence")
+            entry = _presence.get(name, {})
+            if "state" not in entry:
+                entry["state"] = bool(pres) if pres is not None else False
+                entry["ts"]    = msg.get("ts_utc", _utc_now_str())
+            entry["online"] = bool(online)
+            _presence[name] = entry
+        elif role == "DOOR":
+            contact = msg.get("contact")
+            if name not in _door:
+                _door[name] = {"state":     contact if contact else "CLOSED",
+                               "ts":        msg.get("ts_utc", _utc_now_str()),
+                               "opened_at": 0,
+                               "closed_at": 0}
     tcp_forward(msg)
 
 
@@ -835,24 +1107,22 @@ def _handle_sensor_presence(msg):
         return
 
     is_yes = (state_val.strip().upper() == "YES")
-    _presence[sensor] = {"state": is_yes, "ts": ts}
+    # Preserve the online flag; a sensor that is reporting is by definition online.
+    entry = _presence.get(sensor, {})
+    was_yes = entry.get("state", False)
+    entry["state"]  = is_yes
+    entry["ts"]     = ts
+    entry["online"] = True
+    _presence[sensor] = entry
 
     print("PRESENCE: {} {}".format(sensor, state_val))
     tcp_forward(msg)
 
-    _maybe_evaluate_on_presence_change()
-
-
-def _handle_environment(msg):
-    temp_x100 = msg.get("temp_c_x100", 0)
-    hum_x100  = msg.get("hum_pct_x100", 0)
-    if not isinstance(temp_x100, (int, float)): return
-    if not isinstance(hum_x100,  (int, float)): return
-    sensor  = msg.get("sensor", "?")
-    temp_c  = temp_x100 / 100.0
-    hum_pct = hum_x100  / 100.0
-    print("ENV: {} {:.1f}C {:.1f}%".format(sensor, temp_c, hum_pct))
-    tcp_forward(msg)
+    # Only a RISING edge is evidence of new movement. A sensor going NO must
+    # never be read as "fresh motion" — that previously cancelled the vacancy
+    # window whenever any other sensor happened to still be latched YES.
+    if is_yes and not was_yes:
+        _maybe_evaluate_on_presence_change(sensor)
 
 
 def _handle_door(msg):
@@ -887,7 +1157,11 @@ def _handle_door(msg):
 
     if state_val == "CLOSED" and was == "OPEN":
         print("DOOR CLOSED transition — evaluating unit occupancy")
-        _evaluate_unit_occupancy_on_door_close()
+        _evaluate_unit_occupancy_on_door_close(sensor)
+    elif state_val == "OPEN":
+        # The door reopening invalidates any in-flight vacancy decision: people
+        # may be arriving or leaving. The next close re-arms the window.
+        _cancel_vacancy_eval("door reopened")
 
 
 def _handle_door_alarm(msg):
@@ -906,13 +1180,22 @@ def _handle_sensor_health(msg):
         return
     print("SENSOR HEALTH: {} {}".format(sensor, state_val))
     if state_val.upper() == "OFFLINE":
+        # Do NOT delete the sensor from _presence. Deleting can empty the dict,
+        # which makes _evaluate_unit_occupancy_on_door_close() take its
+        # "no presence sensors" early return and freeze the unit state.
+        # Force the entry to False instead: an offline sensor cannot assert
+        # presence, but the unit still has a known presence sensor set.
         if sensor in _presence:
-            del _presence[sensor]
-            print("PRESENCE dict: removed {} (OFFLINE)".format(sensor))
+            _presence[sensor]["state"]  = False
+            _presence[sensor]["online"] = False
+            print("PRESENCE dict: {} forced NO (OFFLINE)".format(sensor))
         tcp_forward({"type":    "notification",
                      "level":   "warning",
                      "sensor":  sensor,
                      "message": "Sensor {} is OFFLINE".format(sensor)})
+    elif state_val.upper() == "ONLINE":
+        if sensor in _presence:
+            _presence[sensor]["online"] = True
     tcp_forward(msg)
 
 
@@ -937,7 +1220,15 @@ def _handle_heartbeat(msg):
         if role == "PRESENCE" and name:
             pres = s.get("presence", False)
             if isinstance(pres, bool):
-                _presence[name] = {"state": pres, "ts": ts}
+                entry = _presence.get(name, {})
+                entry["state"]  = pres
+                entry["ts"]     = ts
+                entry["online"] = bool(s.get("online", True))
+                _presence[name] = entry
+            # Heartbeat carries the live PIR tuning values (keep_time_sec /
+            # sensitivity). Mirror them into _sensor_live so the Debugger's
+            # tuning tab stays current without an explicit get_config.
+            _merge_sensor_live_by_name(name, s)
         elif role == "DOOR" and name:
             contact = s.get("contact", "CLOSED")
             if name not in _door:
@@ -946,7 +1237,90 @@ def _handle_heartbeat(msg):
             else:
                 _door[name]["state"] = contact
                 _door[name]["ts"]    = ts
+            _merge_sensor_live_by_name(name, s)
     tcp_forward(msg)
+
+
+def _merge_sensor_live_by_name(name, s):
+    """
+    Update the _sensor_live entry matching `name` from a heartbeat sensor dict.
+    Heartbeat has no index, so match on name. Only touches fields the
+    heartbeat actually carries; leaves index/supports_config from
+    config_response intact.
+    """
+    for idx, live in _sensor_live.items():
+        if live.get("name") != name:
+            continue
+        if "online" in s:
+            live["online"] = s.get("online", False)
+        if "battery" in s:
+            live["battery"] = s.get("battery", 0)
+        if "keep_time_sec" in s:
+            live["keep_time_sec"] = s.get("keep_time_sec", PIR_KEEP_TIME_DEFAULT)
+        if "sensitivity" in s:
+            live["sensitivity"] = s.get("sensitivity", PIR_SENSITIVITY_DEFAULT)
+        return
+
+
+def _reconcile_sensor_dicts(sensors):
+    """
+    Rebuild _presence / _door to match the Hub's authoritative sensor list.
+
+    CRITICAL: both dicts are keyed by sensor NAME, and the Hub renames sensors
+    on operator request. Before this existed, renaming "Sensor_1" to "Hall"
+    left a phantom "Sensor_1" entry holding its last known value forever —
+    nothing would ever update it again. If that value was YES, then
+    _any_presence_yes() returned True permanently and the unit could NEVER
+    reach VACANT: every vacancy window was cancelled or expired to OCCUPIED.
+
+    Called from config_response, which the Master requests after every rename,
+    pairing change and sensor removal.
+
+    Also SEEDS entries for known sensors so that a door close occurring before
+    any motion has been reported still finds a populated dict (the engine
+    early-returns when len(_presence) == 0).
+    """
+    live_presence = set()
+    live_door     = set()
+
+    for s in sensors:
+        if not isinstance(s, dict):
+            continue
+        name = s.get("name")
+        role = s.get("role", "")
+        if not name or not isinstance(name, str):
+            continue
+        if role == "PRESENCE":
+            live_presence.add(name)
+            entry = _presence.get(name)
+            if entry is None:
+                # Seed from the Hub's live reading when it provides one, so a
+                # door close occurring before the sensor's first event still
+                # evaluates against reality rather than a guess.
+                pres = s.get("presence")
+                _presence[name] = {"state":  bool(pres) if pres is not None else False,
+                                   "ts":     _utc_now_str(),
+                                   "online": bool(s.get("online", False))}
+            else:
+                entry["online"] = bool(s.get("online", False))
+        elif role == "DOOR":
+            live_door.add(name)
+            if name not in _door:
+                contact = s.get("contact")
+                _door[name] = {"state":     contact if contact else "CLOSED",
+                               "ts":        _utc_now_str(),
+                               "opened_at": 0,
+                               "closed_at": 0}
+
+    # Drop keys the Hub no longer knows about — renamed or removed sensors.
+    for stale in [k for k in _presence if k not in live_presence]:
+        del _presence[stale]
+        print("PRESENCE dict: dropped stale entry '{}' "
+              "(renamed or removed)".format(stale))
+    for stale in [k for k in _door if k not in live_door]:
+        del _door[stale]
+        print("DOOR dict: dropped stale entry '{}' "
+              "(renamed or removed)".format(stale))
 
 
 def _handle_config_response(msg):
@@ -969,14 +1343,21 @@ def _handle_config_response(msg):
                 "role":            s.get("role", ""),
                 "online":          s.get("online", False),
                 "battery":         s.get("battery", 0),
-                "fading_time":     s.get("fading_time", 0),
-                "sensitivity":     s.get("sensitivity", 0),
+                # ZG-204ZL PIR tuning. The Hub sends keep_time_sec (DP10 enum,
+                # one of 10/30/60/120) and sensitivity (DP9 enum, 0..2).
+                "keep_time_sec":   s.get("keep_time_sec",  PIR_KEEP_TIME_DEFAULT),
+                "sensitivity":     s.get("sensitivity",    PIR_SENSITIVITY_DEFAULT),
                 "supports_config": s.get("supports_config", False),
             }
     conf["sensor_hub_config"]["sensor_names"] = names
     save_config()
+
+    # Prune renamed/removed sensors and seed any we have not heard from yet.
+    # This is what keeps a rename from permanently blocking VACANT.
+    _reconcile_sensor_dicts(sensors)
+
     print("CONFIG RESPONSE: {} sensors".format(len(sensors)))
-    # Forward raw — carries fading_time/sensitivity/supports_config for the Debugger
+    # Forward raw — carries keep_time_sec/sensitivity/supports_config for the Debugger
     tcp_forward(msg)
 
 
@@ -1015,7 +1396,6 @@ _SENSOR_MSG_HANDLERS = {
     "pairing_complete":     _handle_pairing_complete,
     "hub_aggregate":        _handle_hub_aggregate,
     "sensor_presence":      _handle_sensor_presence,
-    "environment":          _handle_environment,
     "door":                 _handle_door,
     "door_alarm":           _handle_door_alarm,
     "sensor_health":        _handle_sensor_health,
@@ -1075,25 +1455,28 @@ def hub_cmd_set_sensor_name(sensor_index, name):
     })
 
 
-def hub_cmd_set_sensor_config(sensor_index, fading_time=None, sensitivity=None):
+def hub_cmd_set_sensor_config(sensor_index, keep_time_sec=None, sensitivity=None):
     """
-    Push fading_time and/or motion sensitivity to a presence sensor.
+    Push keep_time and/or motion sensitivity to a ZG-204ZL PIR sensor.
     Pass None to leave a field unchanged.
-      fading_time : 0..28800 seconds
-      sensitivity : 0..19
+      keep_time_sec : snapped to one of 10/30/60/120 (DP10 enum)
+      sensitivity   : 0=low, 1=medium, 2=high (DP9 enum)
+
+    Sent as 'keep_time_sec'; 'fading_time' is included as a legacy alias so
+    older Hub builds that parse the old key still apply the value.
     """
     if not isinstance(sensor_index, int) or sensor_index < 0:
         return
     payload = {"type": "set_sensor_config", "sensor_index": sensor_index}
-    if fading_time is not None:
-        try:    payload["fading_time"] = max(0, min(28800, int(fading_time)))
-        except Exception: pass
+    if keep_time_sec is not None:
+        kt = _snap_keep_time(keep_time_sec)
+        payload["keep_time_sec"] = kt
+        payload["fading_time"]   = kt
     if sensitivity is not None:
-        try:    payload["sensitivity"] = max(0, min(19, int(sensitivity)))
-        except Exception: pass
+        payload["sensitivity"] = _clamp_sensitivity(sensitivity)
     send_to_sensor_hub(payload)
-    print("HUB set_sensor_config idx={} fading={} sensitivity={}".format(
-          sensor_index, payload.get("fading_time"), payload.get("sensitivity")))
+    print("HUB set_sensor_config idx={} keep_time={} sensitivity={}".format(
+          sensor_index, payload.get("keep_time_sec"), payload.get("sensitivity")))
 
 
 def hub_cmd_get_config():
@@ -1136,9 +1519,13 @@ def hub_cmd_push_live_config():
         "watchdog_ping_timeout_sec":     hub_cfg.get("watchdog_ping_timeout_sec",      30),
         "door_alarm_threshold_min":      hub_cfg.get("door_alarm_threshold_min",       10),
         "heartbeat_interval_min":        hub_cfg.get("heartbeat_interval_min",         30),
-        "presence_fading_time_sec":      hub_cfg.get("presence_fading_time_sec",       30),
+        "presence_fading_time_sec":      _snap_keep_time(
+                                            hub_cfg.get("presence_fading_time_sec",
+                                                        PIR_KEEP_TIME_DEFAULT)),
         "door_sensor_max_silence_hours": hub_cfg.get("door_sensor_max_silence_hours",  24),
-        "motion_sensitivity":            hub_cfg.get("motion_sensitivity",             9),
+        "motion_sensitivity":            _clamp_sensitivity(
+                                            hub_cfg.get("motion_sensitivity",
+                                                        PIR_SENSITIVITY_DEFAULT)),
     }
     _hub_config_push_in_progress = True
     send_to_sensor_hub(payload)
@@ -1169,6 +1556,11 @@ def handle_tcp_command(msg):
         name = msg.get("name", "")
         if isinstance(idx, int) and name:
             hub_cmd_set_sensor_name(idx, name)
+            # A rename changes the key used by _presence / _door. Pull the new
+            # sensor list so the old key is pruned; leaving it behind would
+            # strand a stale presence value and permanently block VACANT.
+            _thread.start_new_thread(
+                lambda: (utime.sleep_ms(800), hub_cmd_get_config()), ())
             _tcp_send_ack("set_sensor_name")
         else:
             _tcp_send_ack("set_sensor_name", "error")
@@ -1178,7 +1570,11 @@ def handle_tcp_command(msg):
         if not isinstance(idx, int) or idx < 0:
             _tcp_send_ack("set_sensor_config", "error")
             return
-        hub_cmd_set_sensor_config(idx, msg.get("fading_time"), msg.get("sensitivity"))
+        # Accept keep_time_sec (current) or fading_time (legacy Debugger builds).
+        kt = msg.get("keep_time_sec")
+        if kt is None:
+            kt = msg.get("fading_time")
+        hub_cmd_set_sensor_config(idx, kt, msg.get("sensitivity"))
         # Ask the Hub to report back applied values so the Debugger refreshes.
         _thread.start_new_thread(
             lambda: (utime.sleep_ms(1500), hub_cmd_get_config()), ())
@@ -1271,8 +1667,14 @@ def handle_tcp_command(msg):
                     "heartbeat_interval_min", "presence_fading_time_sec",
                     "door_sensor_max_silence_hours", "motion_sensitivity"):
             if key in msg:
-                try:    hub_cfg[key] = int(msg[key])
-                except Exception: pass
+                try:    val = int(msg[key])
+                except Exception: continue
+                # Constrain the two PIR values to what the ZG-204ZL accepts.
+                if key == "presence_fading_time_sec":
+                    val = _snap_keep_time(val)
+                elif key == "motion_sensitivity":
+                    val = _clamp_sensitivity(val)
+                hub_cfg[key] = val
         if "watchdog_enable" in msg:
             hub_cfg["watchdog_enable"] = bool(msg["watchdog_enable"])
         conf["sensor_hub_config"] = hub_cfg
@@ -1293,7 +1695,17 @@ def handle_tcp_command(msg):
             conf["wifi_password"] = pwd
             save_config()
             _tcp_send_ack("set_wifi_config")
-            print("WIFI CONFIG saved — reboot to apply")
+            # There is no persistence: a reboot reloads master_config.py and
+            # discards this. Do NOT tell the operator to reboot to apply.
+            print("WIFI CONFIG set in RAM for this session only.")
+            print("WIFI CONFIG: to make it permanent, edit wifi_ssid /"
+                  " wifi_password in master_config.py and re-copy the file.")
+            tcp_forward({
+                "type":    "notification",
+                "level":   "warning",
+                "message": "Wi-Fi set for this session only. Reboot reverts "
+                           "to master_config.py — edit that file to persist."
+            })
         else:
             _tcp_send_ack("set_wifi_config", "error")
 
@@ -1447,6 +1859,11 @@ def pending_worker():
                             tcp_forward({"type":           "pending_update",
                                          "pending_status": None})
 
+            # Vacancy confirmation window. MUST run outside the `with
+            # _state_lock` block above: it may call _set_sensor_status(),
+            # which acquires that same non-reentrant lock.
+            _tick_vacancy_eval()
+
             utime.sleep(1)
         except Exception as e:
             print("pending_worker error:", repr(e))
@@ -1585,12 +2002,53 @@ def wifi_and_internet_thread():
 
     if not wlan.isconnected():
         print("WIFI: failed — 2-state fallback")
+        print("WIFI: check that ssid '{}' is correct in master_config.py".format(ssid))
+        # Scan and report what is actually in range. A single mistyped
+        # character in the ssid is otherwise indistinguishable from a wrong
+        # password or an AP that is down.
+        try:
+            found = False
+            print("WIFI: networks in range —")
+            for net in wlan.scan():
+                try:
+                    seen = net[0].decode("utf-8")
+                except Exception:
+                    continue
+                rssi = net[3] if len(net) > 3 else 0
+                if seen == ssid:
+                    found = True
+                    print("   * {} ({} dBm)  <-- matches configured ssid".format(
+                          seen, rssi))
+                else:
+                    print("     {} ({} dBm)".format(seen, rssi))
+            if not found:
+                print("WIFI: ssid '{}' NOT FOUND — it is a typo or the AP"
+                      " is down".format(ssid))
+            else:
+                print("WIFI: ssid found but association failed — check the"
+                      " password")
+        except Exception as e:
+            print("WIFI: scan failed:", repr(e))
         with _state_lock:
             if not _force_active():
                 recalc_and_act()
         while True:
             utime.sleep(30)
             try:
+                # The STA may still be mid-association from the previous
+                # attempt. Calling connect() again in that state raises
+                # "Wifi Internal State Error" (esp: "sta is connecting, cannot
+                # set config") and the retry can never succeed. Tear the
+                # interface down first so every retry starts from a clean state.
+                try:
+                    wlan.disconnect()
+                except Exception:
+                    pass
+                wlan.active(False)
+                utime.sleep_ms(500)
+                wlan.active(True)
+                utime.sleep_ms(200)
+
                 wlan.connect(ssid, pwd)
                 t2 = utime.ticks_add(utime.ticks_ms(), 15000)
                 while not wlan.isconnected():
@@ -1603,6 +2061,8 @@ def wifi_and_internet_thread():
                     print("WIFI: reconnected IP={}".format(_wifi_ip))
                     _maybe_start_tcp_server()
                     break
+                print("WIFI: retry failed — ssid '{}' not found or wrong"
+                      " password".format(ssid))
             except Exception as e:
                 print("WIFI retry error:", repr(e))
 
